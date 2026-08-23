@@ -196,7 +196,6 @@ function render() {
             <strong>${escapeHtml(state.appTitle)}</strong>
             <button class="brand-edit" data-edit-app-title type="button" aria-label="Изменить название">✎</button>
           </div>
-          <span>${viewSubtitle()}</span>
         </div>
         <nav class="desktop-nav" aria-label="Разделы">${renderNavItems()}</nav>
       </header>
@@ -239,13 +238,6 @@ function renderLogin() {
     localStorage.setItem(AUTH_KEY, "ok");
     render();
   });
-}
-
-function viewSubtitle() {
-  if (ui.view === "roster") return formatLongDate(ui.selectedDate);
-  if (ui.view === "stats") return "Отсутствия и итоги";
-  if (ui.view === "employees") return "Состав и роли";
-  return "Ежедневная раскладка";
 }
 
 function renderNavItems() {
@@ -351,11 +343,7 @@ function applyCurrentTemplateToFutureDates() {
 function renderRosterView() {
   const roster = getRoster();
   return `
-    <div class="page-title">
-      <div>
-        <h1>Фото раскладки</h1>
-        <div class="muted small">${roster.blocks.length ? `${roster.blocks.length} блок.` : "Создайте первый блок"}</div>
-      </div>
+    <div class="page-title roster-page-actions">
       <button class="ghost-btn" data-today type="button">Сегодня</button>
     </div>
 
@@ -374,11 +362,7 @@ function renderRosterView() {
       ${renderOthersPanel(roster)}
     </section>
 
-    <div class="bottom-cta">
-      <div>
-        <strong>PNG строится по созданным блокам</strong>
-        <div class="muted small">Повторный выбор сотрудников разрешён в любом блоке.</div>
-      </div>
+    <div class="bottom-cta solo">
       <button class="btn" data-generate-preview type="button" ${roster.blocks.length ? "" : "disabled"}>Сгенерировать PNG</button>
     </div>
   `;
@@ -391,7 +375,6 @@ function renderCustomBlockPanel(block) {
       <div class="panel-head">
         <div>
           <h2>${escapeHtml(block.title)} ${selected.length ? "✓" : ""}</h2>
-          <div class="muted small">Сотрудников можно выбирать повторно</div>
         </div>
         <div class="block-actions">
           <span class="chip yellow">${selected.length}</span>
@@ -437,7 +420,7 @@ function renderOthersPanel(roster) {
     <section class="panel wide">
       <div class="panel-head">
         <div>
-          <h2>Отсутствующие сотрудники</h2>
+          <h2>Отсутствующие</h2>
           <div class="muted small">Укажите отгул, больничный, отпуск или командировку</div>
         </div>
         <span class="chip violet">${activeEmployees.length}</span>
@@ -478,12 +461,12 @@ function renderStatsView() {
 
     <section class="panel" style="margin-bottom:12px">
       <div class="panel-body">
-        <div class="filters">
-          <div class="datebar range-datebar wide">
+        <div class="filters stats-filters">
+          <div class="datebar range-datebar stats-range">
             <button class="date-display" data-open-stats-range type="button">${statsPeriodLabel()}</button>
           </div>
-          <input class="field wide" data-stat-search placeholder="Поиск по фамилии" value="${escapeAttr(ui.stats.search || "")}" />
-          <button class="ghost-btn wide" data-toggle-only-absences type="button">${ui.stats.onlyWithAbsences ? "✓ " : ""}Только с отсутствиями</button>
+          <button class="ghost-btn absence-toggle" data-toggle-only-absences type="button">${ui.stats.onlyWithAbsences ? "✓ " : ""}Только с отсутствиями</button>
+          <input class="field stat-search" data-stat-search placeholder="Поиск по фамилии" value="${escapeAttr(ui.stats.search || "")}" />
         </div>
       </div>
     </section>
@@ -535,8 +518,8 @@ function renderStatPersonCard(row, columns) {
 }
 
 function renderSortTh(key, label) {
-  const marker = ui.stats.sortKey === key ? (ui.stats.sortDir === "asc" ? " ↑" : " ↓") : "";
-  return `<th><button class="ghost-btn" data-sort="${key}" type="button">${label}${marker}</button></th>`;
+  const marker = ui.stats.sortKey === key ? (ui.stats.sortDir === "asc" ? "↑" : "↓") : "";
+  return `<th><button class="ghost-btn sort-btn" data-sort="${key}" type="button"><span>${label}</span><span class="sort-marker">${marker}</span></button></th>`;
 }
 
 function renderEmployeesView() {
@@ -845,13 +828,10 @@ function renderEmployeeFormModal() {
           <div class="field-group"><label>Отчество</label><input class="field" name="middleName" value="${escapeAttr(data.middleName)}" /></div>
           <div class="field-group"><label>Должность</label><input class="field" name="position" value="${escapeAttr(data.position || "")}" placeholder="Например: пожарный, водитель" /></div>
           <div class="field-group"><label>Доп. профессия</label><input class="field" name="additionalProfession" value="${escapeAttr(data.additionalProfession || "")}" placeholder="Например: ГДЗС, электрик, стропальщик" /></div>
-          <div class="status-grid" style="margin-bottom:12px">
-            <label class="status-btn"><input type="checkbox" name="isActive" ${data.isActive ? "checked" : ""} /> Активен</label>
-          </div>
           <div class="field-group"><label>Комментарий</label><textarea class="field" name="comment">${escapeHtml(data.comment || "")}</textarea></div>
           <div class="actions">
             <button class="btn" type="submit">Сохранить</button>
-            ${employee?.isActive ? `<button class="danger-btn" data-archive-employee="${employee.id}" type="button">Архивировать</button>` : ""}
+            ${employee ? `<button class="danger-btn" data-delete-employee="${employee.id}" type="button">Удалить</button>` : ""}
           </div>
         </div>
       </form>
@@ -1039,13 +1019,8 @@ function bindModalEvents() {
   document.querySelector("[data-title-form]")?.addEventListener("submit", saveTitleFromForm);
   document.querySelector("[data-block-form]")?.addEventListener("submit", saveBlockFromForm);
   document.querySelector("[data-employee-form]")?.addEventListener("submit", saveEmployeeFromForm);
-  document.querySelector("[data-archive-employee]")?.addEventListener("click", (event) => {
-    const employee = findEmployee(event.target.dataset.archiveEmployee);
-    employee.isActive = false;
-    employee.updatedAt = new Date().toISOString();
-    persist();
-    ui.modal = null;
-    render();
+  document.querySelector("[data-delete-employee]")?.addEventListener("click", (event) => {
+    deleteEmployee(event.currentTarget.dataset.deleteEmployee);
   });
 }
 
@@ -1133,6 +1108,25 @@ function deleteBlock(blockId) {
   render();
 }
 
+function deleteEmployee(employeeId) {
+  const employee = findEmployee(employeeId);
+  if (!employee) return;
+  if (!window.confirm(`Удалить сотрудника «${employee.shortName}» из приложения?`)) return;
+
+  state.employees = state.employees.filter((item) => item.id !== employeeId);
+  state.absences = state.absences.filter((absence) => absence.employeeId !== employeeId);
+  Object.values(state.rosters || {}).forEach((roster) => {
+    normalizeRoster(roster);
+    roster.blocks.forEach((block) => {
+      block.members = block.members.filter((memberId) => memberId !== employeeId);
+    });
+    roster.updatedAt = new Date().toISOString();
+  });
+  persist();
+  ui.modal = null;
+  render();
+}
+
 async function openGeneratedPreview() {
   ui.modal = { type: "preview" };
   ui.renderedPng = "";
@@ -1171,10 +1165,12 @@ function rosterData(roster) {
     title: state.appTitle,
     date: roster.date,
     dateText: formatLongDate(roster.date),
-    blocks: roster.blocks.map((block) => ({
-      title: block.title,
-      people: block.members.map(personData).filter(Boolean)
-    })),
+    blocks: roster.blocks
+      .map((block) => ({
+        title: block.title,
+        people: block.members.map(personData).filter(Boolean)
+      }))
+      .filter((block) => block.people.length),
     absent
   };
 }
@@ -1202,7 +1198,7 @@ async function generatePng() {
 }
 
 function generateClientPng(data) {
-  const sections = data.blocks.map((block, index) => ({
+  const sections = data.blocks.filter((block) => block.people?.length).map((block, index) => ({
     type: "people",
     title: block.title.toUpperCase(),
     color: ["#ffbf47", "#ff5a2c", "#78dfff", "#ffd36e"][index % 4],
@@ -1701,7 +1697,7 @@ function saveEmployeeFromForm(event) {
   employee.canDriveAkp = form.has("canDriveAkp");
   employee.canDriveCar4 = form.has("canDriveCar4");
   employee.canBeReserveDriver = form.has("canBeReserveDriver");
-  employee.isActive = form.has("isActive");
+  employee.isActive = true;
   employee.comment = String(form.get("comment") || "");
   employee.updatedAt = new Date().toISOString();
   if (!ui.modal.employeeId) state.employees.push(employee);

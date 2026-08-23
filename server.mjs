@@ -156,7 +156,7 @@ function renderDutyRosterVkCard(data) {
     ? data.blocks.map((block) => ({
       title: block.title || "Блок",
       people: Array.isArray(block.people) ? block.people : []
-    }))
+    })).filter((block) => block.people.length)
     : [];
   const absent = Array.isArray(data.absent) ? data.absent : [];
   const sections = [
