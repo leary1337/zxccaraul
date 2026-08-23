@@ -523,7 +523,17 @@ h3 {
 }
 
 .bottom-cta.solo {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
   justify-items: stretch;
+}
+
+.bottom-cta.solo .btn {
+  width: 100%;
+  min-height: 54px;
 }
 
 .bottom-nav {
@@ -1104,7 +1114,7 @@ tr:last-child td {
 
   .bottom-cta.solo {
     grid-template-columns: 1fr;
-    justify-items: end;
+    justify-items: stretch;
   }
 
   .sheet-backdrop {
