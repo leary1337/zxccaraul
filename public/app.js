@@ -729,7 +729,7 @@ function renderStatusPickerSheet() {
           <div class="status-grid">
             ${Object.entries(absenceLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === key ? "active" : ""}" data-set-status="${key}" type="button">${label}</button>`).join("")}
           </div>
-          <div class="actions">
+          <div class="actions status-actions">
             <button class="danger-btn" data-clear-status type="button">Очистить статус</button>
           </div>
         </div>

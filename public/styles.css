@@ -1030,6 +1030,10 @@ tr:last-child td {
   gap: 8px;
 }
 
+.status-actions {
+  margin-top: 14px;
+}
+
 .toolbar {
   display: flex;
   flex-wrap: wrap;
