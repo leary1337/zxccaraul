@@ -1223,7 +1223,7 @@ function generateClientPng(data) {
   const contentRight = 1504;
   const columnGap = 30;
   const columnWidth = (contentRight - contentX - columnGap) / 2;
-  const titleWidth = contentRight - contentX - 420;
+  const titleWidth = contentRight - contentX - 360;
   measureCtx.font = "800 82px Arial, sans-serif";
   const titleLines = wrapCanvasLines(measureCtx, data.title || "Караул", titleWidth);
   const titleBlockHeight = titleLines.length * 86;
@@ -1264,7 +1264,6 @@ function generateClientPng(data) {
   ctx.font = "800 82px Arial, sans-serif";
   titleLines.forEach((line, index) => ctx.fillText(line, contentX, y + index * 86));
   ctx.shadowBlur = 0;
-  drawCanvasFireTruck(ctx, contentRight - 176, y - 18);
   drawCanvasDate(ctx, data.dateText, contentRight - 338, y + 74, 338, 78);
   ctx.textAlign = "left";
   y += headerBlockHeight + 30;
@@ -1467,71 +1466,12 @@ function drawCanvasSharpBands(ctx) {
   ctx.restore();
 }
 
-function drawCanvasFireTruck(ctx, x, y) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.shadowColor = "rgba(0, 0, 0, .34)";
-  ctx.shadowBlur = 18;
-  ctx.shadowOffsetY = 10;
-  ctx.strokeStyle = "#ffd36b";
-  ctx.lineWidth = 5;
-  drawCanvasLine(ctx, 18, 20, 120, 12);
-  drawCanvasLine(ctx, 18, 28, 120, 20);
-  ctx.lineWidth = 3;
-  for (let rung = 32; rung <= 102; rung += 18) {
-    drawCanvasLine(ctx, rung, 18, rung + 2, 25);
-  }
-  ctx.shadowBlur = 0;
-  const body = ctx.createLinearGradient(10, 30, 10, 62);
-  body.addColorStop(0, "#ff4a27");
-  body.addColorStop(1, "#bf2519");
-  ctx.fillStyle = body;
-  fillCanvasRoundRect(ctx, 10, 30, 98, 32, 5);
-  ctx.strokeStyle = "rgba(255, 225, 188, .42)";
-  ctx.lineWidth = 2;
-  strokeCanvasRoundRect(ctx, 10, 30, 98, 32, 5);
-  ctx.fillStyle = "rgba(255, 232, 169, .9)";
-  ctx.fillRect(20, 43, 68, 4);
-  const cab = ctx.createLinearGradient(104, 20, 104, 62);
-  cab.addColorStop(0, "#ff6b35");
-  cab.addColorStop(1, "#cf2e1f");
-  ctx.fillStyle = cab;
-  fillCanvasPolygon(ctx, [[104, 32], [113, 20], [152, 20], [152, 62], [104, 62]]);
-  ctx.strokeStyle = "rgba(255, 225, 188, .42)";
-  ctx.stroke();
-  ctx.fillStyle = "#aee9ff";
-  fillCanvasPolygon(ctx, [[119, 41], [124, 27], [141, 27], [141, 41]]);
-  ctx.fillStyle = "#7adfff";
-  fillCanvasRoundRect(ctx, 66, 24, 18, 8, 4);
-  drawCanvasWheel(ctx, 40, 64);
-  drawCanvasWheel(ctx, 124, 64);
-  ctx.restore();
-}
-
-function drawCanvasWheel(ctx, x, y) {
-  ctx.fillStyle = "#100d0b";
-  ctx.beginPath();
-  ctx.arc(x, y, 12, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = "#39434a";
-  ctx.lineWidth = 5;
-  ctx.stroke();
-}
-
 function measureCanvasText(ctx, text, font) {
   const previousFont = ctx.font;
   ctx.font = font;
   const width = ctx.measureText(text).width;
   ctx.font = previousFont;
   return width;
-}
-
-function drawCanvasGlow(ctx, x, y, radius, inner, outer) {
-  const glow = ctx.createRadialGradient(x, y, 0, x, y, radius);
-  glow.addColorStop(0, inner);
-  glow.addColorStop(1, outer);
-  ctx.fillStyle = glow;
-  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
 }
 
 function drawCanvasLine(ctx, x1, y1, x2, y2) {
@@ -1694,9 +1634,6 @@ function saveEmployeeFromForm(event) {
   employee.position = String(form.get("position") || "").trim();
   employee.additionalProfession = String(form.get("additionalProfession") || "").trim();
   employee.shortName = makeShortName(employee.lastName, employee.firstName, employee.middleName);
-  employee.canDriveAkp = form.has("canDriveAkp");
-  employee.canDriveCar4 = form.has("canDriveCar4");
-  employee.canBeReserveDriver = form.has("canBeReserveDriver");
   employee.isActive = true;
   employee.comment = String(form.get("comment") || "");
   employee.updatedAt = new Date().toISOString();
@@ -1713,10 +1650,6 @@ function allAssignments(roster) {
     block.members.forEach((employeeId, position) => employeeId && items.push({ employeeId, assignmentType: block.id, position }));
   });
   return items;
-}
-
-function findEmployeeAssignment(roster, employeeId) {
-  return allAssignments(roster).find((item) => item.employeeId === employeeId);
 }
 
 function allEmployeeAssignments(roster, employeeId) {
@@ -1742,19 +1675,8 @@ function clearAssignment(roster, assignmentType, position) {
   if (block) block.members = block.members.filter(Boolean).filter((_, index) => index !== position);
 }
 
-function removeEmployeeFromRoster(roster, employeeId) {
-  normalizeRoster(roster);
-  roster.blocks.forEach((block) => {
-    block.members = block.members.filter((id) => id && id !== employeeId);
-  });
-}
-
 function assignmentTitle(assignmentType) {
   return getRoster().blocks.find((block) => block.id === assignmentType)?.title || "Блок";
-}
-
-function formatNames(names) {
-  return names?.length ? names.map(personName).join(", ") : "не назначено";
 }
 
 function employeeRoleHtml(employee) {

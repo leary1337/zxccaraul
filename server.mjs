@@ -1,5 +1,5 @@
 import http from "node:http";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,11 +7,21 @@ import pg from "pg";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
+const cardBackgroundDir = path.join(publicDir, "card-backgrounds");
 const port = Number(process.env.PORT || 5173);
 const host = process.env.HOST || "0.0.0.0";
 const databaseUrl = process.env.DATABASE_URL || "";
 const stateId = process.env.APP_STATE_ID || "main";
 const pool = databaseUrl ? new pg.Pool({ connectionString: databaseUrl }) : null;
+const cardBackgrounds = [
+  "depot-night.png",
+  "ops-map.png",
+  "truck-equipment.png",
+  "fire-water.png",
+  "tactical-sheet.png",
+  "truck-smoke.png"
+];
+const cardBackgroundCache = new Map();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -85,6 +95,16 @@ function escapeHtml(value = "") {
     .replaceAll("'", "&#039;");
 }
 
+function randomCardBackgroundDataUrl() {
+  const fileName = cardBackgrounds[Math.floor(Math.random() * cardBackgrounds.length)];
+  const filePath = path.join(cardBackgroundDir, fileName);
+  if (!cardBackgroundCache.has(fileName)) {
+    const image = readFileSync(filePath);
+    cardBackgroundCache.set(fileName, `data:image/png;base64,${image.toString("base64")}`);
+  }
+  return cardBackgroundCache.get(fileName);
+}
+
 function listItems(items = []) {
   const people = items.length ? items : [{ name: "Не назначено", position: "" }];
   return people.map((person, index) => `
@@ -96,10 +116,6 @@ function listItems(items = []) {
       </div>
     </li>
   `).join("");
-}
-
-function namesText(items = []) {
-  return items.length ? items.map((item) => escapeHtml(personName(item))).join(", ") : "Не назначено";
 }
 
 function personName(person) {
@@ -152,6 +168,7 @@ function renderSection(section) {
 
 function renderDutyRosterVkCard(data) {
   const title = String(data.title || "Караул").trim() || "Караул";
+  const background = randomCardBackgroundDataUrl();
   const blocks = Array.isArray(data.blocks)
     ? data.blocks.map((block) => ({
       title: block.title || "Блок",
@@ -180,48 +197,31 @@ function renderDutyRosterVkCard(data) {
       color: #fff4e6;
       font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     }
-    .card {
-      position: relative;
-      overflow: hidden;
-      width: 1600px;
-      min-height: ${cardHeight}px;
-      padding: 64px 72px;
-      background:
-        radial-gradient(circle at 101% 10%, rgba(70, 190, 255, .28), transparent 34%),
-        linear-gradient(145deg, #14100d 0%, #21120e 39%, #111a20 73%, #0b0d10 100%);
-      border: 1px solid rgba(255, 213, 155, .22);
-    }
-    .card::before,
-    .card::after {
-      content: "";
-      position: absolute;
-      pointer-events: none;
-      inset: auto;
-      z-index: 0;
-    }
-    .card::before {
-      left: 0;
-      right: 0;
-      bottom: 0;
-      height: 220px;
-      background:
-        linear-gradient(118deg, rgba(201, 54, 14, .88) 0 18%, rgba(255, 124, 24, .74) 18% 33%, transparent 33%),
-        linear-gradient(102deg, transparent 0 34%, rgba(255, 206, 89, .48) 34% 47%, transparent 47%),
-        linear-gradient(76deg, transparent 0 58%, rgba(173, 235, 255, .58) 58% 72%, rgba(53, 137, 181, .54) 72% 100%);
-      clip-path: polygon(0 38%, 17% 18%, 38% 44%, 58% 25%, 79% 48%, 100% 20%, 100% 100%, 0 100%);
-      opacity: .74;
-    }
-    .card::after {
-      right: 0;
-      bottom: 0;
-      width: 660px;
-      height: 250px;
-      background:
-        linear-gradient(132deg, transparent 0 32%, rgba(212, 246, 255, .52) 32% 43%, rgba(61, 166, 214, .6) 43% 62%, transparent 62%),
-        linear-gradient(96deg, transparent 0 46%, rgba(255, 244, 209, .24) 46% 56%, transparent 56%);
-      clip-path: polygon(0 44%, 26% 30%, 50% 50%, 75% 26%, 100% 44%, 100% 100%, 0 100%);
-      opacity: .9;
-    }
+	    .card {
+	      position: relative;
+	      overflow: hidden;
+	      width: 1600px;
+	      min-height: ${cardHeight}px;
+	      padding: 64px 72px;
+	      background:
+	        radial-gradient(ellipse at center, rgba(0, 0, 0, .12), rgba(0, 0, 0, .3) 100%),
+	        linear-gradient(180deg, rgba(0, 0, 0, .1), rgba(0, 0, 0, .18)),
+	        url("${background}");
+	      background-size: 100% 100%;
+	      background-position: center;
+	      background-repeat: no-repeat;
+	      border: 1px solid rgba(255, 213, 155, .22);
+	    }
+	    .card::before {
+	      content: "";
+	      position: absolute;
+	      pointer-events: none;
+	      inset: 0;
+	      z-index: 0;
+	      background:
+	        radial-gradient(ellipse at center, rgba(0, 0, 0, .08), rgba(0, 0, 0, .26) 78%),
+	        linear-gradient(180deg, rgba(0, 0, 0, .04), rgba(0, 0, 0, .12));
+	    }
     .topline {
       position: relative;
       z-index: 1;
@@ -233,100 +233,12 @@ function renderDutyRosterVkCard(data) {
       border-bottom: 3px solid rgba(255, 224, 176, .3);
       box-shadow: 0 1px 0 rgba(96, 210, 255, .22);
     }
-    .header-side {
-      display: grid;
-      justify-items: end;
-      gap: 12px;
-      flex: 0 0 340px;
-    }
-    .truck-mark {
-      position: relative;
-      width: 168px;
-      height: 72px;
-      margin-right: 8px;
-      filter: drop-shadow(0 12px 20px rgba(0, 0, 0, .34));
-    }
-    .truck-body,
-    .truck-cab,
-    .truck-ladder,
-    .truck-light,
-    .truck-window,
-    .truck-wheel {
-      position: absolute;
-      display: block;
-    }
-    .truck-body {
-      left: 10px;
-      top: 30px;
-      width: 98px;
-      height: 30px;
-      border-radius: 5px 3px 3px 5px;
-      background: linear-gradient(180deg, #ff4a27, #bf2519);
-      border: 2px solid rgba(255, 225, 188, .4);
-    }
-    .truck-body::before {
-      content: "";
-      position: absolute;
-      left: 10px;
-      top: 11px;
-      width: 68px;
-      height: 4px;
-      background: rgba(255, 232, 169, .9);
-    }
-    .truck-cab {
-      left: 104px;
-      top: 20px;
-      width: 48px;
-      height: 40px;
-      clip-path: polygon(0 30%, 18% 0, 100% 0, 100% 100%, 0 100%);
-      border-radius: 4px;
-      background: linear-gradient(180deg, #ff6b35, #cf2e1f);
-      border: 2px solid rgba(255, 225, 188, .42);
-    }
-    .truck-window {
-      left: 119px;
-      top: 27px;
-      width: 22px;
-      height: 14px;
-      clip-path: polygon(0 100%, 18% 0, 100% 0, 100% 100%);
-      background: #aee9ff;
-    }
-    .truck-ladder {
-      left: 16px;
-      top: 14px;
-      width: 104px;
-      height: 8px;
-      border-top: 3px solid #ffd36b;
-      border-bottom: 3px solid #ffd36b;
-      transform: rotate(-5deg);
-    }
-    .truck-ladder::before {
-      content: "";
-      position: absolute;
-      left: 14px;
-      right: 14px;
-      top: -4px;
-      height: 10px;
-      background: repeating-linear-gradient(90deg, transparent 0 13px, #ffd36b 13px 17px);
-    }
-    .truck-light {
-      left: 66px;
-      top: 24px;
-      width: 18px;
-      height: 8px;
-      border-radius: 9px 9px 2px 2px;
-      background: #7adfff;
-    }
-    .truck-wheel {
-      top: 52px;
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      background: #100d0b;
-      border: 5px solid #39434a;
-    }
-    .truck-wheel.one { left: 28px; }
-    .truck-wheel.two { left: 112px; }
+	    .header-side {
+	      display: grid;
+	      justify-items: end;
+	      gap: 12px;
+	      flex: 0 0 340px;
+	    }
     h1 {
       flex: 1 1 auto;
       min-width: 0;
@@ -502,19 +414,10 @@ function renderDutyRosterVkCard(data) {
 <body>
   <main class="card">
     <div class="topline">
-      <h1>${escapeHtml(title)}</h1>
-      <div class="header-side">
-        <div class="truck-mark" aria-hidden="true">
-          <span class="truck-ladder"></span>
-          <span class="truck-body"></span>
-          <span class="truck-cab"></span>
-          <span class="truck-window"></span>
-          <span class="truck-light"></span>
-          <span class="truck-wheel one"></span>
-          <span class="truck-wheel two"></span>
-        </div>
-        <div class="date">${escapeHtml(data.dateText || data.date || "")}</div>
-      </div>
+	      <h1>${escapeHtml(title)}</h1>
+	      <div class="header-side">
+	        <div class="date">${escapeHtml(data.dateText || data.date || "")}</div>
+	      </div>
     </div>
     <div class="grid">
       <div class="column">${columns[0].map(renderSection).join("")}</div>
