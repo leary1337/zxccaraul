@@ -65,7 +65,6 @@ let ui = {
   stats: {
     from: `${new Date().getFullYear()}-01-01`,
     to: `${new Date().getFullYear()}-12-31`,
-    employeeId: "",
     absenceType: "",
     onlyWithAbsences: false,
     sortKey: "name",
@@ -465,7 +464,6 @@ function renderOthersPanel(roster) {
 
 function renderStatsView() {
   const rows = calculateStats();
-  const selectedEmployee = ui.stats.employeeId ? rows.find((row) => row.employee.id === ui.stats.employeeId) : null;
   const statColumns = [
     ["dayOff", "Отгулы"],
     ["sickLeave", "Больничные"]
@@ -485,16 +483,10 @@ function renderStatsView() {
             <button class="date-display" data-open-stats-range type="button">${statsPeriodLabel()}</button>
           </div>
           <input class="field wide" data-stat-search placeholder="Поиск по фамилии" value="${escapeAttr(ui.stats.search || "")}" />
-          <select class="field" data-stat-field="employeeId">
-            <option value="">Все сотрудники</option>
-            ${state.employees.map((employee) => `<option value="${employee.id}" ${ui.stats.employeeId === employee.id ? "selected" : ""}>${escapeHtml(employee.shortName)}</option>`).join("")}
-          </select>
           <button class="ghost-btn wide" data-toggle-only-absences type="button">${ui.stats.onlyWithAbsences ? "✓ " : ""}Только с отсутствиями</button>
         </div>
       </div>
     </section>
-
-    ${selectedEmployee ? renderEmployeeStatsCard(selectedEmployee) : ""}
 
     <div class="stats-list">
       ${rows.map((row) => renderStatPersonCard(row, statColumns)).join("") || `<div class="empty-state">Нет данных за выбранный период</div>`}
@@ -511,7 +503,7 @@ function renderStatsView() {
         <tbody>
           ${rows.map((row) => `
             <tr>
-              <td><button class="ghost-btn" data-stat-employee="${row.employee.id}" type="button">${escapeHtml(row.employee.shortName)}</button></td>
+              <td>${escapeHtml(row.employee.shortName)}</td>
               ${statColumns.map(([key]) => `<td>${row[key]}</td>`).join("")}
             </tr>
           `).join("") || `<tr><td colspan="${statColumns.length + 1}">Нет данных за выбранный период</td></tr>`}
@@ -523,7 +515,7 @@ function renderStatsView() {
 
 function renderStatPersonCard(row, columns) {
   return `
-    <button class="stat-person-card" data-stat-employee="${row.employee.id}" type="button">
+    <article class="stat-person-card">
       <span class="stat-person-head">
         <span>
           <strong>${escapeHtml(row.employee.shortName)}</strong>
@@ -538,47 +530,13 @@ function renderStatPersonCard(row, columns) {
           </span>
         `).join("")}
       </span>
-    </button>
+    </article>
   `;
 }
 
 function renderSortTh(key, label) {
   const marker = ui.stats.sortKey === key ? (ui.stats.sortDir === "asc" ? " ↑" : " ↓") : "";
   return `<th><button class="ghost-btn" data-sort="${key}" type="button">${label}${marker}</button></th>`;
-}
-
-function renderEmployeeStatsCard(row) {
-  const events = state.absences
-    .filter((absence) => absence.employeeId === row.employee.id)
-    .filter((absence) => absence.absenceType === "DAY_OFF" || absence.absenceType === "SICK_LEAVE")
-    .sort((a, b) => b.dateFrom.localeCompare(a.dateFrom));
-  const byMonth = calculateMonthlyStats(row.employee.id);
-  return `
-    <section class="panel" style="margin-bottom:12px">
-      <div class="panel-head">
-        <div>
-          <h2>${escapeHtml(row.employee.shortName)}</h2>
-          <div class="muted small">${statsPeriodLabel()}</div>
-        </div>
-        <button class="ghost-btn" data-clear-stat-employee type="button">Все</button>
-      </div>
-      <div class="panel-body">
-        <div class="stat-cards">
-          <div class="metric"><strong>${row.dayOff}</strong><span>Отгулы</span></div>
-          <div class="metric"><strong>${row.sickLeave}</strong><span>Больничные</span></div>
-        </div>
-        <h3>По месяцам</h3>
-        <div class="stat-table-wrap" style="margin-bottom:12px">
-          <table>
-            <thead><tr><th>Месяц</th><th>Отгулы</th><th>Больничные</th></tr></thead>
-            <tbody>${byMonth.map((month) => `<tr><td>${monthNames[month.month]}</td><td>${month.dayOff}</td><td>${month.sickLeave}</td></tr>`).join("")}</tbody>
-          </table>
-        </div>
-        <h3>События</h3>
-        ${events.map((event) => `<div class="absence-row"><div><strong>${periodShort(event.dateFrom, event.dateTo)}</strong><div class="muted small">${absenceLabels[event.absenceType]}${event.comment ? ` · ${escapeHtml(event.comment)}` : ""}</div></div></div>`).join("") || `<div class="empty-state">Событий отсутствия нет.</div>`}
-      </div>
-    </section>
-  `;
 }
 
 function renderEmployeesView() {
@@ -986,14 +944,6 @@ function bindStatsEvents() {
     cycleSort(button.dataset.sort);
     render();
   }));
-  document.querySelectorAll("[data-stat-employee]").forEach((button) => button.addEventListener("click", () => {
-    ui.stats.employeeId = button.dataset.statEmployee;
-    render();
-  }));
-  document.querySelector("[data-clear-stat-employee]")?.addEventListener("click", () => {
-    ui.stats.employeeId = "";
-    render();
-  });
 }
 
 function bindEmployeeEvents() {
@@ -1688,7 +1638,6 @@ function calculateStats() {
   });
 
   rows = rows.filter((row) => !search || employeeSearchText(row.employee).includes(search));
-  rows = rows.filter((row) => !ui.stats.employeeId || row.employee.id === ui.stats.employeeId);
   rows = rows.filter((row) => !ui.stats.onlyWithAbsences || row.total > 0);
 
   if (ui.stats.sortKey) {
@@ -1699,21 +1648,6 @@ function calculateStats() {
     });
   }
   return rows;
-}
-
-function calculateMonthlyStats(employeeId) {
-  const year = parseIsoDate(ui.stats.from || isoDate(new Date())).getFullYear();
-  return Array.from({ length: 12 }, (_, month) => {
-    const from = `${year}-${String(month + 1).padStart(2, "0")}-01`;
-    const to = isoDate(new Date(year, month + 1, 0));
-    const totals = { month, dayOff: 0, sickLeave: 0 };
-    state.absences.filter((absence) => absence.employeeId === employeeId).forEach((absence) => {
-      const days = overlapDays(absence.dateFrom, absence.dateTo, from, to);
-      if (absence.absenceType === "DAY_OFF") totals.dayOff += days;
-      if (absence.absenceType === "SICK_LEAVE") totals.sickLeave += days;
-    });
-    return totals;
-  });
 }
 
 function cycleSort(key) {
@@ -1906,10 +1840,6 @@ function formatShortDate(value) {
 function absencePeriodText(absence) {
   if (absence.dateFrom === absence.dateTo) return `${absenceLabels[absence.absenceType]} на день`;
   return `${absenceLabels[absence.absenceType]} до ${formatShortDate(absence.dateTo)}`;
-}
-
-function periodShort(from, to) {
-  return from === to ? formatShortDate(from) : `${formatShortDate(from)} — ${formatShortDate(to)}`;
 }
 
 function dateInRange(date, from, to) {

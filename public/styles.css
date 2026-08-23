@@ -1039,6 +1039,10 @@ tr:last-child td {
 
   .main {
     grid-column: 2;
+    width: 100%;
+    min-width: 0;
+    max-width: 1200px;
+    margin: 0;
     padding: 24px;
   }
 
@@ -1061,11 +1065,15 @@ tr:last-child td {
   }
 
   .filters {
-    grid-template-columns: repeat(4, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   }
 
   .filters .wide {
     grid-column: auto;
+  }
+
+  .filters .ghost-btn {
+    white-space: normal;
   }
 
   .stat-cards {
