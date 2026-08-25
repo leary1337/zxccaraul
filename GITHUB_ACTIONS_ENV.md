@@ -10,7 +10,6 @@
 | `SERVER_PORT` | `22` | prepare, deploy | SSH-порт; также разрешается в UFW. |
 | `SERVER_USERNAME` | `deploy` | prepare, deploy | Пользователь с SSH-доступом, passwordless `sudo` для первичной подготовки и доступом к Docker после неё. |
 | `SERVER_APP_PATH` | `/opt/zxccaraul` | prepare, deploy | Абсолютный путь production bundle на сервере. Каталог должен принадлежать deploy-пользователю или создаваться им через `sudo`. На общем сервере у каждого Environment должен быть отдельный путь. |
-| `SERVER_HOST_FINGERPRINT` | `SHA256:…` | prepare, deploy | Проверенный SHA256 fingerprint SSH host key; защищает workflow от подключения к подменённому серверу. |
 | `APP_PUBLIC_URL` | `https://caraul.scanbet.pro` | prepare, deploy | Публичный HTTPS URL без path, query, credentials и явного порта. Для production используйте `https://caraul.scanbet.pro`; до prepare DNS должен резолвиться публично. |
 | `LETSENCRYPT_EMAIL` | `ops@example.com` | prepare | Email регистрации и уведомлений Let’s Encrypt. |
 | `GHCR_USERNAME` | `leary1337` | deploy | GitHub user, которому принадлежит `GHCR_PAT` и разрешено читать package образа. |
@@ -48,15 +47,6 @@
 ssh-keygen -t ed25519 -a 100 -f ./zxccaraul-deploy -C github-actions-zxccaraul
 ssh-copy-id -i ./zxccaraul-deploy.pub -p 22 deploy@203.0.113.10
 ```
-
-Получите fingerprint host key и обязательно сравните его с fingerprint, показанным непосредственно на сервере или у хостинг-провайдера:
-
-```bash
-ssh-keyscan -p 22 -t ed25519 203.0.113.10 2>/dev/null \
-  | ssh-keygen -lf - -E sha256
-```
-
-В `SERVER_HOST_FINGERPRINT` сохраните поле вида `SHA256:...`, а не всю строку команды.
 
 Сгенерируйте пароль Postgres:
 

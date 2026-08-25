@@ -35,7 +35,6 @@ jobs:
           SERVER_PORT: ${{ vars.SERVER_PORT }}
           SERVER_USERNAME: ${{ vars.SERVER_USERNAME }}
           SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
-          SERVER_HOST_FINGERPRINT: ${{ vars.SERVER_HOST_FINGERPRINT }}
           APP_PUBLIC_URL: ${{ vars.APP_PUBLIC_URL }}
           LETSENCRYPT_EMAIL: ${{ vars.LETSENCRYPT_EMAIL }}
           SERVER_PRIVATE_KEY: ${{ secrets.SERVER_PRIVATE_KEY }}
@@ -46,7 +45,6 @@ jobs:
             SERVER_PORT
             SERVER_USERNAME
             SERVER_APP_PATH
-            SERVER_HOST_FINGERPRINT
             APP_PUBLIC_URL
             LETSENCRYPT_EMAIL
             SERVER_PRIVATE_KEY
@@ -119,7 +117,6 @@ jobs:
           port: ${{ vars.SERVER_PORT }}
           key: ${{ secrets.SERVER_PRIVATE_KEY }}
           passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
-          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
           envs: SERVER_APP_PATH
           script: |
             set -euo pipefail
@@ -141,7 +138,6 @@ jobs:
           port: ${{ vars.SERVER_PORT }}
           key: ${{ secrets.SERVER_PRIVATE_KEY }}
           passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
-          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
           source: "config/nginx/,scripts/deploy-host-nginx.sh,scripts/prepare-deploy-host.sh,.deploy-secrets/"
           target: ${{ vars.SERVER_APP_PATH }}
 
@@ -160,7 +156,6 @@ jobs:
           port: ${{ vars.SERVER_PORT }}
           key: ${{ secrets.SERVER_PRIVATE_KEY }}
           passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
-          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
           envs: APP_DOMAIN,APP_PORT,DEPLOYMENT_ID,LETSENCRYPT_EMAIL,SERVER_APP_PATH,SSH_PORT
           command_timeout: 30m
           script: |

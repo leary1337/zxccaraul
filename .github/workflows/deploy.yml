@@ -44,7 +44,6 @@ jobs:
           SERVER_PORT: ${{ vars.SERVER_PORT }}
           SERVER_USERNAME: ${{ vars.SERVER_USERNAME }}
           SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
-          SERVER_HOST_FINGERPRINT: ${{ vars.SERVER_HOST_FINGERPRINT }}
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME }}
           APP_PUBLIC_URL: ${{ vars.APP_PUBLIC_URL }}
           POSTGRES_DB: ${{ vars.POSTGRES_DB }}
@@ -58,7 +57,6 @@ jobs:
             SERVER_PORT
             SERVER_USERNAME
             SERVER_APP_PATH
-            SERVER_HOST_FINGERPRINT
             GHCR_USERNAME
             APP_PUBLIC_URL
             POSTGRES_DB
@@ -243,7 +241,6 @@ jobs:
           port: ${{ vars.SERVER_PORT }}
           key: ${{ secrets.SERVER_PRIVATE_KEY }}
           passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
-          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
           source: "release/"
           target: ${{ vars.SERVER_APP_PATH }}
 
@@ -259,7 +256,6 @@ jobs:
           port: ${{ vars.SERVER_PORT }}
           key: ${{ secrets.SERVER_PRIVATE_KEY }}
           passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
-          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
           envs: GHCR_PAT,GHCR_USERNAME,SERVER_APP_PATH
           command_timeout: 10m
           script: |
