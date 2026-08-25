@@ -1,0 +1,81 @@
+name: ${COMPOSE_PROJECT_NAME:-zxccaraul}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    stop_grace_period: 30s
+    logging: *default-logging
+
+  app:
+    image: ${ZXCCARAUL_IMAGE:?ZXCCARAUL_IMAGE is required}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    shm_size: 512mb
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 5173
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      APP_STATE_ID: ${APP_STATE_ID:-main}
+    secrets:
+      - postgres_password
+    ports:
+      - "127.0.0.1:${APP_PORT:-5173}:5173"
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/readyz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 30s
+    logging: *default-logging
+
+networks:
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  postgres_data:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password

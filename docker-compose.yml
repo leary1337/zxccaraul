@@ -13,20 +13,33 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
 
   app:
     build: .
+    init: true
     restart: unless-stopped
+    shm_size: 512mb
     environment:
       HOST: 0.0.0.0
       PORT: 5173
-      DATABASE_URL: postgres://${POSTGRES_USER:-caraul}:${POSTGRES_PASSWORD:-caraul_password}@db:5432/${POSTGRES_DB:-caraul}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-caraul}
+      POSTGRES_USER: ${POSTGRES_USER:-caraul}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-caraul_password}
       APP_STATE_ID: ${APP_STATE_ID:-main}
     ports:
-      - "${APP_PORT:-5173}:5173"
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-5173}:5173"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/readyz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres_data:

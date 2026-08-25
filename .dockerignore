@@ -2,5 +2,15 @@ node_modules
 npm-debug.log
 .git
 .DS_Store
-.env
+.env*
 tmp
+backups
+config
+release
+secrets
+.deploy-*
+.github
+docker-compose*.yml
+GITHUB_ACTIONS_ENV.md
+README.md
+scripts

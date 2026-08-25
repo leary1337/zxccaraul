@@ -1,0 +1,277 @@
+name: Build and deploy zxccaraul
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment to deploy
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      release_tag:
+        description: Optional Docker tag; defaults to the first 12 characters of commit SHA
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  validate:
+    name: Validate release configuration
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      app_port: ${{ steps.app.outputs.app_port }}
+      app_state_id: ${{ steps.app.outputs.app_state_id }}
+      compose_project_name: ${{ steps.app.outputs.compose_project_name }}
+      image_tag: ${{ steps.image.outputs.image_tag }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Validate GitHub Environment
+        uses: ./.github/actions/validate-required-env
+        env:
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_PORT: ${{ vars.SERVER_PORT }}
+          SERVER_USERNAME: ${{ vars.SERVER_USERNAME }}
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+          SERVER_HOST_FINGERPRINT: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          GHCR_USERNAME: ${{ vars.GHCR_USERNAME }}
+          APP_PUBLIC_URL: ${{ vars.APP_PUBLIC_URL }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          SERVER_PRIVATE_KEY: ${{ secrets.SERVER_PRIVATE_KEY }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        with:
+          variables: |
+            SERVER_HOST
+            SERVER_PORT
+            SERVER_USERNAME
+            SERVER_APP_PATH
+            SERVER_HOST_FINGERPRINT
+            GHCR_USERNAME
+            APP_PUBLIC_URL
+            POSTGRES_DB
+            POSTGRES_USER
+            SERVER_PRIVATE_KEY
+            GHCR_PAT
+            POSTGRES_PASSWORD
+          source_hint: selected GitHub Environment
+
+      - name: Resolve application configuration
+        id: app
+        uses: ./.github/actions/resolve-app-config
+        with:
+          app_public_url: ${{ vars.APP_PUBLIC_URL }}
+          app_port: ${{ vars.APP_PORT || '5173' }}
+          app_state_id: ${{ vars.APP_STATE_ID || 'main' }}
+          compose_project_name: ${{ vars.COMPOSE_PROJECT_NAME || format('zxccaraul-{0}', inputs.environment) }}
+
+      - name: Validate deployment identifiers
+        env:
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+          SERVER_PORT: ${{ vars.SERVER_PORT }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import PurePosixPath
+
+          server_path = os.environ["SERVER_APP_PATH"]
+          parsed_path = PurePosixPath(server_path)
+          if (
+              not parsed_path.is_absolute()
+              or server_path == "/"
+              or ".." in parsed_path.parts
+              or not re.fullmatch(r"/[A-Za-z0-9._/-]+", server_path)
+          ):
+              raise SystemExit("SERVER_APP_PATH must be a safe absolute POSIX path below root")
+
+          try:
+              server_port = int(os.environ["SERVER_PORT"])
+          except ValueError as exc:
+              raise SystemExit("SERVER_PORT must be an integer") from exc
+          if not 1 <= server_port <= 65535:
+              raise SystemExit("SERVER_PORT must be in range 1..65535")
+
+          identifier_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+          for name in ("POSTGRES_DB", "POSTGRES_USER"):
+              if not identifier_re.fullmatch(os.environ[name]):
+                  raise SystemExit(f"{name} must be a safe PostgreSQL identifier")
+          PY
+
+      - name: Resolve image tag
+        id: image
+        env:
+          EXPLICIT_TAG: ${{ inputs.release_tag }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          image_tag="${EXPLICIT_TAG:-${COMMIT_SHA:0:12}}"
+          if [[ ! "${image_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "release_tag is not a valid Docker tag: ${image_tag}" >&2
+            exit 1
+          fi
+          printf 'image_tag=%s\n' "${image_tag}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Check, build and publish image
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.image.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies and check sources
+        run: |
+          npm ci --no-audit
+          npm run check
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          cache-from: type=gha,scope=zxccaraul
+          cache-to: type=gha,mode=max,scope=zxccaraul
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.image_tag }}
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.image_tag }}
+
+  deploy:
+    name: Deploy healthy release
+    needs:
+      - validate
+      - build
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_PUBLIC_URL }}
+    concurrency:
+      group: zxccaraul-server-operations
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build runtime bundle
+        env:
+          APP_PORT: ${{ needs.validate.outputs.app_port }}
+          APP_STATE_ID: ${{ needs.validate.outputs.app_state_id }}
+          COMPOSE_PROJECT_NAME: ${{ needs.validate.outputs.compose_project_name }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          ZXCCARAUL_IMAGE: ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${POSTGRES_PASSWORD}" == *$'\n'* || "${POSTGRES_PASSWORD}" == *$'\r'* || "${#POSTGRES_PASSWORD}" -lt 20 ]]; then
+            echo "POSTGRES_PASSWORD must contain at least 20 characters and no line breaks" >&2
+            exit 1
+          fi
+
+          rm -rf release
+          mkdir -p release/secrets
+          install -m 0644 docker-compose.prod.yml release/docker-compose.prod.yml
+          install -m 0755 scripts/deploy-release.sh release/deploy-release.sh
+
+          {
+            printf 'COMPOSE_PROJECT_NAME=%s\n' "${COMPOSE_PROJECT_NAME}"
+            printf 'ZXCCARAUL_IMAGE=%s\n' "${ZXCCARAUL_IMAGE}"
+            printf 'POSTGRES_DB=%s\n' "${POSTGRES_DB}"
+            printf 'POSTGRES_USER=%s\n' "${POSTGRES_USER}"
+            printf 'APP_STATE_ID=%s\n' "${APP_STATE_ID}"
+            printf 'APP_PORT=%s\n' "${APP_PORT}"
+          } > release/runtime.env
+          chmod 600 release/runtime.env
+
+          printf '%s' "${POSTGRES_PASSWORD}" > release/secrets/postgres_password
+          chmod 600 release/secrets/postgres_password
+
+      - name: Copy runtime bundle to server
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USERNAME }}
+          port: ${{ vars.SERVER_PORT }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
+          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          source: "release/"
+          target: ${{ vars.SERVER_APP_PATH }}
+
+      - name: Deploy release on server
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GHCR_USERNAME: ${{ vars.GHCR_USERNAME }}
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USERNAME }}
+          port: ${{ vars.SERVER_PORT }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
+          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          envs: GHCR_PAT,GHCR_USERNAME,SERVER_APP_PATH
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+
+            registry_config="$(mktemp -d)"
+            cleanup_registry_config() {
+              rm -rf -- "${registry_config}"
+            }
+            trap cleanup_registry_config EXIT
+            export DOCKER_CONFIG="${registry_config}"
+
+            printf '%s' "${GHCR_PAT}" | docker login ghcr.io --username "${GHCR_USERNAME}" --password-stdin
+            chmod +x "${SERVER_APP_PATH}/release/deploy-release.sh"
+            "${SERVER_APP_PATH}/release/deploy-release.sh" "${SERVER_APP_PATH}"

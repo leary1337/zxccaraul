@@ -1,0 +1,105 @@
+name: Resolve application configuration
+description: Validate public URL and runtime identifiers, then expose normalized values
+
+inputs:
+  app_public_url:
+    description: Public HTTPS URL of the application
+    required: true
+  app_port:
+    description: Loopback port exposed by Docker Compose
+    required: true
+  app_state_id:
+    description: Postgres state namespace
+    required: true
+  compose_project_name:
+    description: Docker Compose project name
+    required: true
+  check_dns:
+    description: Require the public hostname to resolve from the GitHub runner
+    required: false
+    default: "false"
+
+outputs:
+  app_domain:
+    description: Bare hostname derived from app_public_url
+    value: ${{ steps.resolve.outputs.app_domain }}
+  app_port:
+    description: Validated loopback port
+    value: ${{ steps.resolve.outputs.app_port }}
+  app_state_id:
+    description: Validated state namespace
+    value: ${{ steps.resolve.outputs.app_state_id }}
+  compose_project_name:
+    description: Validated Compose project name
+    value: ${{ steps.resolve.outputs.compose_project_name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate and resolve application configuration
+      id: resolve
+      shell: bash
+      env:
+        APP_PUBLIC_URL: ${{ inputs.app_public_url }}
+        APP_PORT: ${{ inputs.app_port }}
+        APP_STATE_ID: ${{ inputs.app_state_id }}
+        COMPOSE_PROJECT_NAME: ${{ inputs.compose_project_name }}
+        CHECK_DNS: ${{ inputs.check_dns }}
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+        import os
+        import re
+        import socket
+        from urllib.parse import urlparse
+
+        hostname_re = re.compile(
+            r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+        )
+        compose_name_re = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+        public_url = os.environ["APP_PUBLIC_URL"].strip()
+        parsed = urlparse(public_url)
+        if parsed.scheme != "https":
+            raise SystemExit("APP_PUBLIC_URL must use https")
+        if not parsed.hostname or not hostname_re.fullmatch(parsed.hostname):
+            raise SystemExit("APP_PUBLIC_URL must contain a valid public hostname")
+        if parsed.username or parsed.password or parsed.port:
+            raise SystemExit("APP_PUBLIC_URL must not contain credentials or an explicit port")
+        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+            raise SystemExit("APP_PUBLIC_URL must not contain a path, params, query or fragment")
+
+        try:
+            app_port = int(os.environ["APP_PORT"])
+        except ValueError as exc:
+            raise SystemExit("APP_PORT must be an integer") from exc
+        if not 1 <= app_port <= 65535:
+            raise SystemExit("APP_PORT must be in range 1..65535")
+
+        app_state_id = os.environ["APP_STATE_ID"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", app_state_id):
+            raise SystemExit("APP_STATE_ID must contain 1..128 letters, digits, dots, underscores or hyphens")
+
+        compose_project_name = os.environ["COMPOSE_PROJECT_NAME"].strip()
+        if not compose_name_re.fullmatch(compose_project_name):
+            raise SystemExit(
+                "COMPOSE_PROJECT_NAME must contain 1..63 lowercase letters, digits, underscores or hyphens"
+            )
+
+        if os.environ["CHECK_DNS"].lower() == "true":
+            try:
+                records = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+            except socket.gaierror as exc:
+                raise SystemExit(
+                    f"APP_PUBLIC_URL hostname {parsed.hostname} is not publicly resolvable; "
+                    "create its A/AAAA or CNAME record before preparing the host"
+                ) from exc
+            if not records:
+                raise SystemExit(f"APP_PUBLIC_URL hostname {parsed.hostname} has no A/AAAA records")
+
+        print(f"app_domain={parsed.hostname}")
+        print(f"app_port={app_port}")
+        print(f"app_state_id={app_state_id}")
+        print(f"compose_project_name={compose_project_name}")
+        PY

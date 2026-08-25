@@ -1,0 +1,171 @@
+name: Prepare deploy host
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment with host configuration
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  prepare:
+    name: Prepare Ubuntu/Debian host
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: zxccaraul-server-operations
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Validate GitHub Environment
+        uses: ./.github/actions/validate-required-env
+        env:
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_PORT: ${{ vars.SERVER_PORT }}
+          SERVER_USERNAME: ${{ vars.SERVER_USERNAME }}
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+          SERVER_HOST_FINGERPRINT: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          APP_PUBLIC_URL: ${{ vars.APP_PUBLIC_URL }}
+          LETSENCRYPT_EMAIL: ${{ vars.LETSENCRYPT_EMAIL }}
+          SERVER_PRIVATE_KEY: ${{ secrets.SERVER_PRIVATE_KEY }}
+          APP_HTPASSWD: ${{ secrets.APP_HTPASSWD }}
+        with:
+          variables: |
+            SERVER_HOST
+            SERVER_PORT
+            SERVER_USERNAME
+            SERVER_APP_PATH
+            SERVER_HOST_FINGERPRINT
+            APP_PUBLIC_URL
+            LETSENCRYPT_EMAIL
+            SERVER_PRIVATE_KEY
+            APP_HTPASSWD
+          source_hint: selected GitHub Environment
+
+      - name: Resolve application configuration
+        id: app
+        uses: ./.github/actions/resolve-app-config
+        with:
+          app_public_url: ${{ vars.APP_PUBLIC_URL }}
+          app_port: ${{ vars.APP_PORT || '5173' }}
+          app_state_id: ${{ vars.APP_STATE_ID || 'main' }}
+          compose_project_name: ${{ vars.COMPOSE_PROJECT_NAME || format('zxccaraul-{0}', inputs.environment) }}
+          check_dns: "true"
+
+      - name: Validate host identifiers
+        env:
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+          SERVER_PORT: ${{ vars.SERVER_PORT }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import PurePosixPath
+
+          server_path = os.environ["SERVER_APP_PATH"]
+          parsed_path = PurePosixPath(server_path)
+          if (
+              not parsed_path.is_absolute()
+              or server_path == "/"
+              or ".." in parsed_path.parts
+              or not re.fullmatch(r"/[A-Za-z0-9._/-]+", server_path)
+          ):
+              raise SystemExit("SERVER_APP_PATH must be a safe absolute POSIX path below root")
+
+          try:
+              server_port = int(os.environ["SERVER_PORT"])
+          except ValueError as exc:
+              raise SystemExit("SERVER_PORT must be an integer") from exc
+          if not 1 <= server_port <= 65535:
+              raise SystemExit("SERVER_PORT must be in range 1..65535")
+          PY
+
+      - name: Build host secret bundle
+        env:
+          APP_HTPASSWD: ${{ secrets.APP_HTPASSWD }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${APP_HTPASSWD}" != *:* || "${APP_HTPASSWD}" == *$'\n'* || "${APP_HTPASSWD}" == *$'\r'* ]]; then
+            echo "APP_HTPASSWD must be exactly one htpasswd login:hash line" >&2
+            exit 1
+          fi
+
+          rm -rf .deploy-secrets
+          mkdir -p .deploy-secrets
+          printf '%s' "${APP_HTPASSWD}" > .deploy-secrets/app_htpasswd
+          chmod 600 .deploy-secrets/app_htpasswd
+
+      - name: Create application directory
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USERNAME }}
+          port: ${{ vars.SERVER_PORT }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
+          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          envs: SERVER_APP_PATH
+          script: |
+            set -euo pipefail
+
+            if [[ -d "${SERVER_APP_PATH}" ]]; then
+              if [[ ! -w "${SERVER_APP_PATH}" ]]; then
+                echo "existing SERVER_APP_PATH is not writable by the deploy user: ${SERVER_APP_PATH}" >&2
+                exit 1
+              fi
+            elif ! mkdir -p "${SERVER_APP_PATH}"; then
+              sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "${SERVER_APP_PATH}"
+            fi
+
+      - name: Copy host bootstrap bundle
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USERNAME }}
+          port: ${{ vars.SERVER_PORT }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
+          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          source: "config/nginx/,scripts/deploy-host-nginx.sh,scripts/prepare-deploy-host.sh,.deploy-secrets/"
+          target: ${{ vars.SERVER_APP_PATH }}
+
+      - name: Prepare host
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          APP_DOMAIN: ${{ steps.app.outputs.app_domain }}
+          APP_PORT: ${{ steps.app.outputs.app_port }}
+          DEPLOYMENT_ID: ${{ steps.app.outputs.compose_project_name }}
+          LETSENCRYPT_EMAIL: ${{ vars.LETSENCRYPT_EMAIL }}
+          SERVER_APP_PATH: ${{ vars.SERVER_APP_PATH }}
+          SSH_PORT: ${{ vars.SERVER_PORT }}
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USERNAME }}
+          port: ${{ vars.SERVER_PORT }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SERVER_KEY_PASSPHRASE }}
+          fingerprint: ${{ vars.SERVER_HOST_FINGERPRINT }}
+          envs: APP_DOMAIN,APP_PORT,DEPLOYMENT_ID,LETSENCRYPT_EMAIL,SERVER_APP_PATH,SSH_PORT
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            cd "${SERVER_APP_PATH}"
+            chmod +x ./scripts/prepare-deploy-host.sh ./scripts/deploy-host-nginx.sh
+            ./scripts/prepare-deploy-host.sh "${SERVER_APP_PATH}"

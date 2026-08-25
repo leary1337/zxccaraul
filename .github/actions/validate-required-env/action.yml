@@ -1,0 +1,43 @@
+name: Validate required environment variables
+description: Ensure a newline-separated list of environment variables is present and non-empty
+
+inputs:
+  variables:
+    description: Newline-separated environment variable names to require
+    required: true
+  source_hint:
+    description: Optional hint shown in the validation error message
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Validate environment variables
+      shell: bash
+      env:
+        VARIABLES: ${{ inputs.variables }}
+        SOURCE_HINT: ${{ inputs.source_hint }}
+      run: |
+        set -euo pipefail
+
+        missing=()
+
+        while IFS= read -r name; do
+          name="${name#"${name%%[![:space:]]*}"}"
+          name="${name%"${name##*[![:space:]]}"}"
+          if [[ -z "${name}" ]]; then
+            continue
+          fi
+          if [[ -z "${!name:-}" ]]; then
+            missing+=("${name}")
+          fi
+        done <<< "${VARIABLES}"
+
+        if [[ "${#missing[@]}" -gt 0 ]]; then
+          hint_suffix=""
+          if [[ -n "${SOURCE_HINT:-}" ]]; then
+            hint_suffix=" (${SOURCE_HINT})"
+          fi
+          echo "::error title=Missing required environment variables::Missing required environment variables${hint_suffix}: ${missing[*]}"
+          exit 1
+        fi

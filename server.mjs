@@ -12,7 +12,45 @@ const port = Number(process.env.PORT || 5173);
 const host = process.env.HOST || "0.0.0.0";
 const databaseUrl = process.env.DATABASE_URL || "";
 const stateId = process.env.APP_STATE_ID || "main";
-const pool = databaseUrl ? new pg.Pool({ connectionString: databaseUrl }) : null;
+
+function readSecret(filePath) {
+  if (!filePath) return "";
+  return readFileSync(filePath, "utf8").replace(/\r?\n$/, "");
+}
+
+function createDatabasePool() {
+  if (databaseUrl) return new pg.Pool({ connectionString: databaseUrl });
+
+  const databaseHost = process.env.POSTGRES_HOST || "";
+  if (!databaseHost) return null;
+
+  const databasePort = Number(process.env.POSTGRES_PORT || 5432);
+  const databaseName = process.env.POSTGRES_DB || "";
+  const databaseUser = process.env.POSTGRES_USER || "";
+  const databasePassword = process.env.POSTGRES_PASSWORD
+    || readSecret(process.env.POSTGRES_PASSWORD_FILE || "");
+
+  if (!Number.isInteger(databasePort) || databasePort < 1 || databasePort > 65535) {
+    throw new Error("POSTGRES_PORT должен быть целым числом от 1 до 65535");
+  }
+  if (!databaseName || !databaseUser || !databasePassword) {
+    throw new Error("Для подключения к Postgres нужны POSTGRES_DB, POSTGRES_USER и POSTGRES_PASSWORD(_FILE)");
+  }
+
+  return new pg.Pool({
+    host: databaseHost,
+    port: databasePort,
+    database: databaseName,
+    user: databaseUser,
+    password: databasePassword
+  });
+}
+
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  throw new Error("PORT должен быть целым числом от 1 до 65535");
+}
+
+const pool = createDatabasePool();
 const cardBackgrounds = [
   "depot-night.png",
   "ops-map.png",
@@ -41,6 +79,31 @@ function sendJson(res, status, payload) {
     "cache-control": "no-store"
   });
   res.end(body);
+}
+
+async function handleHealth(req, res) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  if (req.url === "/healthz") {
+    sendJson(res, 200, { status: "ok" });
+    return;
+  }
+
+  if (!pool) {
+    sendJson(res, 200, { status: "ok", database: "disabled" });
+    return;
+  }
+
+  try {
+    await pool.query("select 1");
+    sendJson(res, 200, { status: "ok", database: "ok" });
+  } catch (error) {
+    console.error("Проверка готовности Postgres завершилась ошибкой:", error);
+    sendJson(res, 503, { status: "unavailable", database: "error" });
+  }
 }
 
 async function ensureDatabase() {
@@ -486,6 +549,11 @@ async function handleApi(req, res) {
 }
 
 const server = http.createServer(async (req, res) => {
+  if (req.url === "/healthz" || req.url === "/readyz") {
+    await handleHealth(req, res);
+    return;
+  }
+
   if (req.url?.startsWith("/api/")) {
     await handleApi(req, res);
     return;
@@ -523,3 +591,43 @@ ensureDatabase()
     console.error("Не удалось подготовить Postgres:", error);
     process.exit(1);
   });
+
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Получен ${signal}: завершаем HTTP-сервер и подключения к Postgres`);
+
+  const forceExitTimer = setTimeout(() => {
+    console.error("Graceful shutdown не завершился за 20 секунд; процесс будет остановлен принудительно");
+    process.exit(1);
+  }, 20_000);
+  forceExitTimer.unref();
+
+  server.close(async (serverError) => {
+    try {
+      if (pool) await pool.end();
+    } catch (poolError) {
+      console.error("Не удалось корректно закрыть пул Postgres во время shutdown:", poolError);
+      process.exitCode = 1;
+    }
+
+    if (serverError) {
+      console.error("Не удалось корректно закрыть HTTP-сервер:", serverError);
+      process.exitCode = 1;
+    }
+
+    clearTimeout(forceExitTimer);
+    process.exit(process.exitCode || 0);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+if (pool) {
+  pool.on("error", (error) => {
+    console.error("Фоновое подключение пула Postgres завершилось ошибкой; следующие запросы попробуют переподключиться:", error);
+  });
+}
