@@ -432,13 +432,26 @@ h3 {
 }
 
 .employee-row {
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 34px 1fr auto;
 }
 
 .employee-row > div,
 .picker-option > span,
 .stat-person-head > span {
   min-width: 0;
+}
+
+.employee-number {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .row-title {

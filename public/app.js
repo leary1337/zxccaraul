@@ -28,6 +28,15 @@ const absenceSortOrder = {
   DAY_OFF: 1
 };
 
+const employeePositionSortOrder = {
+  rds: 0,
+  pnk: 1,
+  ko: 2,
+  firefighter: 3,
+  driver: 4,
+  other: 5
+};
+
 const monthNames = [
   "Январь",
   "Февраль",
@@ -556,7 +565,7 @@ function renderEmployeesView() {
   const query = ui.employeeSearch.toLowerCase();
   const rows = state.employees
     .filter((employee) => !query || employeeSearchText(employee).includes(query))
-    .sort((a, b) => a.lastName.localeCompare(b.lastName, "ru"));
+    .sort(compareEmployeesForDirectory);
   return `
     <div class="page-title">
       <h1>Сотрудники</h1>
@@ -567,8 +576,9 @@ function renderEmployeesView() {
     </div>
     <section class="panel">
       <div class="panel-body">
-        ${rows.map((employee) => `
+        ${rows.map((employee, index) => `
           <div class="employee-row">
+            <span class="employee-number">${index + 1}</span>
             <div>
               <div class="row-title">${escapeHtml(employee.shortName)} ${employee.isActive ? "" : `<span class="chip">Архив</span>`}</div>
               <div class="row-subtitle role-line">${employeeRoleHtml(employee)}</div>
@@ -1815,6 +1825,26 @@ function comparePeopleForRosterCard(a, b) {
 
 function compareEmployeesByName(a, b) {
   return String(a.lastName || a.shortName || "").localeCompare(String(b.lastName || b.shortName || ""), "ru");
+}
+
+function compareEmployeesForDirectory(a, b) {
+  const positionDiff = employeePositionSortOrder[employeePositionGroup(a)] - employeePositionSortOrder[employeePositionGroup(b)];
+  if (positionDiff) return positionDiff;
+  return compareEmployeesByName(a, b);
+}
+
+function employeePositionGroup(employee) {
+  const position = normalizePositionText(employee.position);
+  if (position.includes("рдс")) return "rds";
+  if (position.includes("пнк")) return "pnk";
+  if (position === "ко" || position.includes("командир отделения")) return "ko";
+  if (position.includes("пожарн")) return "firefighter";
+  if (isDriverPosition(position)) return "driver";
+  return "other";
+}
+
+function normalizePositionText(value) {
+  return String(value || "").toLowerCase().replaceAll(".", "").replace(/\s+/g, " ").trim();
 }
 
 function compareAbsenceItems(a, b) {
