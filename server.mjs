@@ -60,6 +60,10 @@ const cardBackgrounds = [
   "truck-smoke.png"
 ];
 const cardBackgroundCache = new Map();
+const absenceSortOrder = {
+  VACATION: 0,
+  DAY_OFF: 1
+};
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -189,7 +193,25 @@ function personPosition(person) {
   return typeof person === "string" ? "" : person?.position || "";
 }
 
+function isDriverPosition(position) {
+  return /\bводител[ьяеюй]?/i.test(String(position || "").toLowerCase());
+}
+
+function compareRosterPeople(a, b) {
+  const driverDiff = Number(isDriverPosition(personPosition(a))) - Number(isDriverPosition(personPosition(b)));
+  if (driverDiff) return driverDiff;
+  return String(a?.lastName || personName(a)).localeCompare(String(b?.lastName || personName(b)), "ru");
+}
+
+function compareAbsentItems(a, b) {
+  const orderA = absenceSortOrder[a?.absenceType] ?? 2;
+  const orderB = absenceSortOrder[b?.absenceType] ?? 2;
+  if (orderA !== orderB) return orderA - orderB;
+  return String(a?.lastName || personName(a)).localeCompare(String(b?.lastName || personName(b)), "ru");
+}
+
 function sectionHeight(section) {
+  if (section.kind === "comment") return 170 + Math.ceil(String(section.text || "").length / 42) * 42;
   return 118 + Math.max(1, section.kind === "absent" ? section.items.length : section.people.length) * (section.kind === "absent" ? 82 : 76);
 }
 
@@ -205,6 +227,14 @@ function distributeSections(sections) {
 }
 
 function renderSection(section) {
+  if (section.kind === "comment") {
+    return `
+      <section class="tone-${section.tone} comment-section">
+        <h2>Комментарий</h2>
+        <p>${escapeHtml(section.text)}</p>
+      </section>
+    `;
+  }
   if (section.kind === "absent") {
     return `
       <section class="tone-${section.tone}">
@@ -235,13 +265,15 @@ function renderDutyRosterVkCard(data) {
   const blocks = Array.isArray(data.blocks)
     ? data.blocks.map((block) => ({
       title: block.title || "Блок",
-      people: Array.isArray(block.people) ? block.people : []
+      people: Array.isArray(block.people) ? [...block.people].sort(compareRosterPeople) : []
     })).filter((block) => block.people.length)
     : [];
-  const absent = Array.isArray(data.absent) ? data.absent : [];
+  const absent = Array.isArray(data.absent) ? [...data.absent].sort(compareAbsentItems) : [];
+  const comment = String(data.comment || "").trim();
   const sections = [
     ...blocks.map((block, index) => ({ kind: "people", title: block.title, people: block.people, tone: index % 4 })),
-    ...(absent.length ? [{ kind: "absent", items: absent, tone: blocks.length % 4 }] : [])
+    ...(absent.length ? [{ kind: "absent", items: absent, tone: blocks.length % 4 }] : []),
+    ...(comment ? [{ kind: "comment", text: comment, tone: (blocks.length + (absent.length ? 1 : 0)) % 4 }] : [])
   ];
   const { columns, heights } = distributeSections(sections);
   const cardHeight = Math.max(620, 280 + Math.max(...heights, 0));
@@ -471,6 +503,15 @@ function renderDutyRosterVkCard(data) {
       color: #dff6ff;
       font-weight: 760;
       white-space: nowrap;
+    }
+    .comment-section p {
+      margin: 0;
+      color: #fff8ef;
+      font-size: 32px;
+      line-height: 1.3;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
     }
   </style>
 </head>

@@ -16,6 +16,8 @@
   --blue-text: #9ed7ff;
   --yellow: #493718;
   --yellow-text: #ffd978;
+  --orange: #4a2418;
+  --orange-text: #ffbf9e;
   --violet: #332944;
   --violet-text: #d7c2ff;
   --shadow: 0 18px 54px rgba(0, 0, 0, .42);
@@ -328,6 +330,12 @@ h3 {
   border-color: #ecd78f;
 }
 
+.chip.orange {
+  background: var(--orange);
+  color: var(--orange-text);
+  border-color: #ff9d72;
+}
+
 .chip.violet {
   background: var(--violet);
   color: var(--violet-text);
@@ -636,6 +644,10 @@ textarea.field {
   min-height: 84px;
   padding-top: 10px;
   resize: vertical;
+}
+
+.roster-comment {
+  min-height: 92px;
 }
 
 .field-group {

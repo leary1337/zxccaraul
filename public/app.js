@@ -11,14 +11,21 @@ const absenceLabels = {
   DAY_OFF: "Отгул",
   SICK_LEAVE: "Больничный",
   VACATION: "Отпуск",
-  BUSINESS_TRIP: "Командировка"
+  BUSINESS_TRIP: "Командировка",
+  SUBSTITUTE: "Подмена"
 };
 
 const absenceColors = {
   DAY_OFF: "green",
   SICK_LEAVE: "blue",
   VACATION: "violet",
-  BUSINESS_TRIP: "yellow"
+  BUSINESS_TRIP: "yellow",
+  SUBSTITUTE: "orange"
+};
+
+const absenceSortOrder = {
+  VACATION: 0,
+  DAY_OFF: 1
 };
 
 const monthNames = [
@@ -112,11 +119,12 @@ function normalizeState(nextState) {
 
 function normalizeTemplateBlocks(blocks = []) {
   return Array.isArray(blocks)
-    ? blocks.map((block) => ({ title: String(block.title || "").trim() })).filter((block) => block.title)
+    ? blocks.map((block) => ({ title: normalizeBlockTitle(String(block.title || "").trim()) })).filter((block) => block.title)
     : [];
 }
 
 function normalizeRoster(roster) {
+  roster.comment = String(roster.comment || "");
   if (!Array.isArray(roster.blocks)) {
     const blocks = [];
     const addLegacyBlock = (title, members = []) => {
@@ -133,7 +141,7 @@ function normalizeRoster(roster) {
   }
   roster.blocks = roster.blocks.map((block) => ({
     id: block.id || createId("block"),
-    title: String(block.title || "Новый блок").trim() || "Новый блок",
+    title: normalizeBlockTitle(String(block.title || "Новый блок").trim() || "Новый блок"),
     members: Array.isArray(block.members) ? block.members.filter(Boolean) : []
   }));
   delete roster.firstShift;
@@ -359,6 +367,7 @@ function renderRosterView() {
 
     <section class="dashboard-grid">
       ${roster.blocks.map((block) => renderCustomBlockPanel(block)).join("") || renderEmptyBlocksPanel()}
+      ${renderRosterCommentPanel(roster)}
       ${renderOthersPanel(roster)}
     </section>
 
@@ -370,11 +379,12 @@ function renderRosterView() {
 
 function renderCustomBlockPanel(block) {
   const selected = block.members.filter(Boolean);
+  const title = blockTitleForDate(block.title, ui.selectedDate);
   return `
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>${escapeHtml(block.title)} ${selected.length ? "✓" : ""}</h2>
+          <h2>${escapeHtml(title)} ${selected.length ? "✓" : ""}</h2>
         </div>
         <div class="block-actions">
           <span class="chip yellow">${selected.length}</span>
@@ -387,6 +397,22 @@ function renderCustomBlockPanel(block) {
           ${selected.map((employeeId, index) => renderAssignmentSlot(block.id, index, employeeId)).join("")}
           ${renderAssignmentSlot(block.id, selected.length, "")}
         </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderRosterCommentPanel(roster) {
+  return `
+    <section class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h2>Комментарий</h2>
+          <div class="muted small">Короткая заметка для фото раскладки</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <textarea class="field roster-comment" data-roster-comment maxlength="240" placeholder="Например: сбор в 8:30">${escapeHtml(roster.comment || "")}</textarea>
       </div>
     </section>
   `;
@@ -406,7 +432,7 @@ function renderAssignmentSlot(blockId, index, employeeId) {
   const employee = findEmployee(employeeId);
   const block = getRoster().blocks.find((item) => item.id === blockId);
   return `
-    <button class="slot ${employee ? "" : "empty"}" data-pick-assignment="${escapeAttr(blockId)}" data-assignment-title="${escapeAttr(block?.title || "Блок")}" data-position="${index}" type="button">
+    <button class="slot ${employee ? "" : "empty"}" data-pick-assignment="${escapeAttr(blockId)}" data-assignment-title="${escapeAttr(block ? blockTitleForDate(block.title, ui.selectedDate) : "Блок")}" data-position="${index}" type="button">
       <span class="slot-index">${index + 1}</span>
       <span class="slot-name">${employee ? escapeHtml(employee.shortName) : "+ Выбрать сотрудника"}</span>
       <span class="slot-meta">${employee ? "Изменить" : ""}</span>
@@ -415,13 +441,17 @@ function renderAssignmentSlot(blockId, index, employeeId) {
 }
 
 function renderOthersPanel(roster) {
-  const activeEmployees = state.employees.filter((employee) => employee.isActive);
+  const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId));
+  const activeEmployees = state.employees
+    .filter((employee) => employee.isActive)
+    .filter((employee) => !assignedEmployeeIds.has(employee.id))
+    .sort(compareEmployeesByName);
   return `
     <section class="panel wide">
       <div class="panel-head">
         <div>
           <h2>Отсутствующие</h2>
-          <div class="muted small">Укажите отгул, больничный, отпуск или командировку</div>
+          <div class="muted small">Укажите отгул, больничный, отпуск, командировку или подмену</div>
         </div>
         <span class="chip violet">${activeEmployees.length}</span>
       </div>
@@ -893,6 +923,9 @@ function bindRosterEvents() {
   document.querySelectorAll("[data-delete-block]").forEach((button) => button.addEventListener("click", () => {
     deleteBlock(button.dataset.deleteBlock);
   }));
+  document.querySelector("[data-roster-comment]")?.addEventListener("input", (event) => {
+    updateRosterComment(event.target.value);
+  });
   document.querySelectorAll("[data-status-employee]").forEach((button) => button.addEventListener("click", () => {
     ui.sheet = { type: "statusPicker", employeeId: button.dataset.statusEmployee };
     render();
@@ -1071,13 +1104,22 @@ function clearAbsenceStatus(employeeId, date) {
 
 function updateRoster(mutator) {
   const roster = getRoster();
-  const before = JSON.stringify(roster.blocks);
+  const before = JSON.stringify({ blocks: roster.blocks, comment: roster.comment });
   mutator(roster);
   normalizeRoster(roster);
-  const after = JSON.stringify(roster.blocks);
+  const after = JSON.stringify({ blocks: roster.blocks, comment: roster.comment });
   if (before !== after) {
     roster.updatedAt = new Date().toISOString();
   }
+  persist();
+}
+
+function updateRosterComment(value) {
+  const roster = getRoster();
+  const comment = String(value || "").slice(0, 240);
+  if (roster.comment === comment) return;
+  roster.comment = comment;
+  roster.updatedAt = new Date().toISOString();
   persist();
 }
 
@@ -1148,27 +1190,32 @@ function saveTitleFromForm(event) {
 function rosterData(roster) {
   const personData = (id) => {
     const employee = findEmployee(id);
-    return employee ? { name: employee.shortName, position: employee.position || "" } : null;
+    return employee ? { name: employee.shortName, position: employee.position || "", lastName: employee.lastName || "" } : null;
   };
   normalizeRoster(roster);
+  const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId));
   const absent = state.employees
     .filter((employee) => employee.isActive)
+    .filter((employee) => !assignedEmployeeIds.has(employee.id))
     .map((employee) => ({ employee, absence: getAbsenceForDate(employee.id, roster.date) }))
     .filter((item) => item.absence)
-    .sort((a, b) => a.employee.lastName.localeCompare(b.employee.lastName, "ru"))
+    .sort(compareAbsenceItems)
     .map((item) => ({
       name: item.employee.shortName,
       position: item.employee.position || "",
-      status: absenceLabels[item.absence.absenceType]
+      lastName: item.employee.lastName || "",
+      status: absenceLabels[item.absence.absenceType],
+      absenceType: item.absence.absenceType
     }));
   return {
     title: state.appTitle,
     date: roster.date,
     dateText: formatLongDate(roster.date),
+    comment: roster.comment || "",
     blocks: roster.blocks
       .map((block) => ({
-        title: block.title,
-        people: block.members.map(personData).filter(Boolean)
+        title: blockTitleForDate(block.title, roster.date),
+        people: block.members.map(personData).filter(Boolean).sort(comparePeopleForRosterCard)
       }))
       .filter((block) => block.people.length),
     absent
@@ -1214,6 +1261,15 @@ function generateClientPng(data) {
         item.status,
         item.position || ""
       ])
+    });
+  }
+  const comment = String(data.comment || "").trim();
+  if (comment) {
+    sections.push({
+      type: "comment",
+      title: "КОММЕНТАРИЙ",
+      color: "#ffd36e",
+      text: comment
     });
   }
   const canvas = document.createElement("canvas");
@@ -1279,6 +1335,8 @@ function generateClientPng(data) {
   placements.forEach(({ section, x: sectionX, y: sectionY, width }) => {
     if (section.type === "people") {
       drawPeopleSection(ctx, section.title, section.people, sectionX, sectionY, section.color, width);
+    } else if (section.type === "comment") {
+      drawCommentSection(ctx, section.title, section.text, sectionX, sectionY, section.color, width);
     } else {
       drawRowsSection(ctx, section.title, section.rows, sectionX, sectionY, section.color, width);
     }
@@ -1295,6 +1353,11 @@ function measureCanvasSection(ctx, section, width = 908) {
     return headerHeight + people.reduce((sum, person) => {
       return sum + measureCanvasPersonBlock(ctx, person, width) + 24;
     }, 0) + 36;
+  }
+  if (section.type === "comment") {
+    ctx.font = "700 32px Arial, sans-serif";
+    const lines = wrapCanvasLines(ctx, section.text || "", width - 28);
+    return headerHeight + lines.length * 42 + 52;
   }
   return headerHeight + section.rows.reduce((sum, [label, value, position]) => {
     ctx.font = "800 34px Arial, sans-serif";
@@ -1412,6 +1475,19 @@ function drawRowsSection(ctx, title, rows, x, y, color, width = 908) {
     y += rowHeight + 30;
   });
   return y + 34;
+}
+
+function drawCommentSection(ctx, title, text, x, y, color, width = 908) {
+  const top = y;
+  const height = measureCanvasSection(ctx, { type: "comment", title, text }, width);
+  drawCanvasPanel(ctx, x, top, width, height);
+  y = drawSectionHeader(ctx, title, x, y, color, width);
+  ctx.fillStyle = "#fff8ef";
+  ctx.font = "700 32px Arial, sans-serif";
+  wrapCanvasLines(ctx, text || "", width - 28).forEach((line, index) => {
+    ctx.fillText(line, x, y + index * 42);
+  });
+  return top + height;
 }
 
 function drawCanvasPanel(ctx, x, y, width, height) {
@@ -1676,7 +1752,8 @@ function clearAssignment(roster, assignmentType, position) {
 }
 
 function assignmentTitle(assignmentType) {
-  return getRoster().blocks.find((block) => block.id === assignmentType)?.title || "Блок";
+  const block = getRoster().blocks.find((item) => item.id === assignmentType);
+  return block ? blockTitleForDate(block.title, ui.selectedDate) : "Блок";
 }
 
 function employeeRoleHtml(employee) {
@@ -1712,6 +1789,39 @@ function createId(prefix) {
 
 function reserveDriverLabel(date) {
   return `Резервный водитель на ${formatDayMonth(isoDate(addDays(parseIsoDate(date), 2)))}`;
+}
+
+function normalizeBlockTitle(title) {
+  return isReserveDriverTitle(title) ? "Резервный водитель" : title;
+}
+
+function blockTitleForDate(title, date) {
+  return isReserveDriverTitle(title) ? reserveDriverLabel(date) : title;
+}
+
+function isReserveDriverTitle(title) {
+  return /^резервн(?:ый|ого)?\s+водител/i.test(String(title || "").trim());
+}
+
+function isDriverPosition(position) {
+  return /\bводител[ьяеюй]?/i.test(String(position || "").toLowerCase());
+}
+
+function comparePeopleForRosterCard(a, b) {
+  const driverDiff = Number(isDriverPosition(a.position)) - Number(isDriverPosition(b.position));
+  if (driverDiff) return driverDiff;
+  return String(a.lastName || a.name || "").localeCompare(String(b.lastName || b.name || ""), "ru");
+}
+
+function compareEmployeesByName(a, b) {
+  return String(a.lastName || a.shortName || "").localeCompare(String(b.lastName || b.shortName || ""), "ru");
+}
+
+function compareAbsenceItems(a, b) {
+  const orderA = absenceSortOrder[a.absence.absenceType] ?? 2;
+  const orderB = absenceSortOrder[b.absence.absenceType] ?? 2;
+  if (orderA !== orderB) return orderA - orderB;
+  return compareEmployeesByName(a.employee, b.employee);
 }
 
 function formatDayMonth(value) {
