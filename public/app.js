@@ -1804,7 +1804,7 @@ function isReserveDriverTitle(title) {
 }
 
 function isDriverPosition(position) {
-  return /\bводител[ьяеюй]?/i.test(String(position || "").toLowerCase());
+  return String(position || "").toLowerCase().includes("водител");
 }
 
 function comparePeopleForRosterCard(a, b) {
