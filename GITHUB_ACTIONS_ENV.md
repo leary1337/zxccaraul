@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | `APP_PORT` | `5173` | Loopback-порт хоста `127.0.0.1`, на который Nginx проксирует запросы. Для нескольких окружений на одном сервере задайте разные порты. |
 | `APP_STATE_ID` | `main` | Ключ строки в `app_state`. Менять после запуска следует только намеренно: другое значение выглядит как отдельное пустое состояние приложения. |
-| `COMPOSE_PROJECT_NAME` | `zxccaraul-<environment>` | Namespace контейнеров, сети, Postgres volume, Nginx site и htpasswd. Для нескольких окружений на одном сервере значения обязаны различаться. Допустимы строчные буквы, цифры, `_` и `-`. |
+| `COMPOSE_PROJECT_NAME` | `zxccaraul-<environment>` | Namespace контейнеров, сети, Postgres volume и Nginx site. Для нескольких окружений на одном сервере значения обязаны различаться. Допустимы строчные буквы, цифры, `_` и `-`. |
 
 ## Обязательные secrets
 
@@ -31,7 +31,6 @@
 | `SERVER_PRIVATE_KEY` | prepare, deploy | Приватный SSH-ключ deploy-пользователя. Публичная часть должна быть в `~/.ssh/authorized_keys` на сервере. |
 | `GHCR_PAT` | deploy | Classic PAT с минимум `read:packages` и доступом к приватному GHCR package. Если организация использует SSO, токен нужно авторизовать для неё. |
 | `POSTGRES_PASSWORD` | deploy | Сильный уникальный пароль Postgres длиной не менее 20 символов без перевода строки. Он записывается на сервер только в файл Docker secret с mode `0600`. |
-| `APP_HTPASSWD` | prepare | Полная строка `login:bcrypt-hash` для Nginx Basic Auth. Защищает и UI, и API. |
 
 ## Опциональный secret
 
@@ -54,19 +53,13 @@ ssh-copy-id -i ./zxccaraul-deploy.pub -p 22 deploy@203.0.113.10
 openssl rand -base64 36
 ```
 
-Сгенерируйте bcrypt-строку Basic Auth (в secret копируется вся строка `karaul:$2y$...`):
-
-```bash
-docker run --rm httpd:2.4-alpine htpasswd -nbB karaul 'replace-with-a-long-password'
-```
-
 `GHCR_PAT` нужен только серверу для pull приватного образа. Сборка и push выполняются встроенным `GITHUB_TOKEN` репозитория с `packages: write`; отдельный write-token сохранять в secrets не требуется.
 
 ## Порядок запуска workflow
 
-1. `Prepare deploy host` — после настройки DNS, при первом запуске, смене домена/порта или ротации `APP_HTPASSWD`.
+1. `Prepare deploy host` — после настройки DNS, при первом запуске или смене домена/порта.
 2. `Build and deploy zxccaraul` — для каждого релиза. Можно оставить `release_tag` пустым.
 
 Оба workflow используют общую concurrency group и не изменяют сервер одновременно. Deploy публикует новый image, копирует runtime bundle, делает предрелизный `pg_dump`, поднимает Compose с `--wait` и при ошибке возвращает прежние `.env`, Compose и Docker secret. Postgres volume при rollback не удаляется.
 
-Если `staging` и `production` находятся на одном сервере, задайте им разные `APP_PUBLIC_URL`, `SERVER_APP_PATH`, `APP_PORT` и `COMPOSE_PROJECT_NAME`. Nginx-конфигурация и Basic Auth именуются по `COMPOSE_PROJECT_NAME`, поэтому два контура не перезаписывают друг друга.
+Если `staging` и `production` находятся на одном сервере, задайте им разные `APP_PUBLIC_URL`, `SERVER_APP_PATH`, `APP_PORT` и `COMPOSE_PROJECT_NAME`. Nginx-конфигурация именуется по `COMPOSE_PROJECT_NAME`, поэтому два контура не перезаписывают друг друга.

@@ -46,9 +46,6 @@ if [[ ! "${DEPLOYMENT_ID}" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
 fi
 
 TEMPLATE_DIR="${APP_PATH}/config/nginx"
-DEPLOY_SECRETS_DIR="${APP_PATH}/.deploy-secrets"
-HTPASSWD_SOURCE="${DEPLOY_SECRETS_DIR}/app_htpasswd"
-HTPASSWD_TARGET="/etc/nginx/.htpasswd-${DEPLOYMENT_ID}"
 SITE_TARGET="/etc/nginx/sites-available/${DEPLOYMENT_ID}.conf"
 SITE_LINK="/etc/nginx/sites-enabled/${DEPLOYMENT_ID}.conf"
 CERT_NAME="${APP_DOMAIN}"
@@ -56,7 +53,7 @@ CERT_DIR="/etc/letsencrypt/live/${CERT_NAME}"
 CERTBOT_WEBROOT="/var/www/certbot"
 RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-nginx-${DEPLOYMENT_ID}.sh"
 
-for required_file in "${TEMPLATE_DIR}/bootstrap.conf.tmpl" "${TEMPLATE_DIR}/app.conf.tmpl" "${HTPASSWD_SOURCE}"; do
+for required_file in "${TEMPLATE_DIR}/bootstrap.conf.tmpl" "${TEMPLATE_DIR}/app.conf.tmpl"; do
   if [[ ! -s "${required_file}" ]]; then
     echo "не найден или пуст обязательный файл настройки Nginx: ${required_file}" >&2
     exit 1
@@ -86,7 +83,6 @@ reload_nginx() {
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
-  rm -f -- "${HTPASSWD_SOURCE}"
   rm -rf -- "${TMP_DIR}"
 }
 trap cleanup EXIT
@@ -95,7 +91,6 @@ render_template "${TEMPLATE_DIR}/bootstrap.conf.tmpl" "${TMP_DIR}/bootstrap.conf
 render_template "${TEMPLATE_DIR}/app.conf.tmpl" "${TMP_DIR}/app.conf"
 
 ${SUDO} install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled "${CERTBOT_WEBROOT}"
-${SUDO} install -m 0640 -o root -g www-data "${HTPASSWD_SOURCE}" "${HTPASSWD_TARGET}"
 
 if [[ ! -s "${CERT_DIR}/fullchain.pem" || ! -s "${CERT_DIR}/privkey.pem" ]]; then
   ${SUDO} install -m 0644 "${TMP_DIR}/bootstrap.conf" "${SITE_TARGET}"

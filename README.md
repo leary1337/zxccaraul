@@ -39,7 +39,7 @@ Postgres хранит данные в Docker volume `postgres_data`, поэто�
 Репозиторий содержит самостоятельный production-контур, построенный по модели `arb-deploy`:
 
 - [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) проверяет JavaScript, shell-скрипты и оба Compose-файла;
-- [`.github/workflows/prepare-host.yml`](./.github/workflows/prepare-host.yml) один раз подготавливает Ubuntu/Debian: Docker, Compose, Nginx, firewall, Basic Auth и TLS от Let’s Encrypt;
+- [`.github/workflows/prepare-host.yml`](./.github/workflows/prepare-host.yml) один раз подготавливает Ubuntu/Debian: Docker, Compose, Nginx, firewall и TLS от Let’s Encrypt;
 - [`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) проверяет исходники, публикует приватный образ в GHCR и разворачивает healthy-релиз через SSH;
 - [`docker-compose.prod.yml`](./docker-compose.prod.yml) запускает приложение и Postgres в изолированной сети, публикуя приложение только на loopback хоста;
 - [`scripts/deploy-release.sh`](./scripts/deploy-release.sh) перед обновлением сохраняет `pg_dump`, ждёт healthcheck и восстанавливает прежнюю конфигурацию при ошибке.
@@ -54,7 +54,7 @@ Postgres-пароль передаётся контейнерам как Docker 
 4. Запустите workflow `Prepare deploy host` для выбранного Environment.
 5. После его успеха запустите `Build and deploy zxccaraul`. Пустой `release_tag` автоматически заменяется первыми 12 символами commit SHA.
 
-Повторные релизы требуют только шага 5. Для смены домена, loopback-порта, SSH-порта или `APP_HTPASSWD` обновите GitHub Environment и повторно запустите `Prepare deploy host`, затем обычный deploy.
+Повторные релизы требуют только шага 5. Для смены домена, loopback-порта или SSH-порта обновите GitHub Environment и повторно запустите `Prepare deploy host`, затем обычный deploy.
 
 ### Эксплуатация на сервере
 
@@ -77,7 +77,7 @@ gzip -dc backups/postgres-20260825T120000Z.sql.gz \
 
 Резервные копии не удаляются автоматически: срок хранения нужно определить отдельно и включить каталог `backups/` в резервное копирование хоста.
 
-Важно: встроенный PIN `1234` — только интерфейсная демо-блокировка. Реальную защиту production URL и API обеспечивает Nginx Basic Auth из GitHub secret `APP_HTPASSWD`.
+Важно: production URL и API доступны публично. Встроенный PIN `1234` — только интерфейсная демо-блокировка и не защищает API от прямых запросов.
 
 ## Что хранится в БД
 

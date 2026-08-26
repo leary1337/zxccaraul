@@ -4,7 +4,6 @@ server {
     server_tokens off;
 
     location ^~ /.well-known/acme-challenge/ {
-        auth_basic off;
         root /var/www/certbot;
         default_type text/plain;
     }
@@ -31,9 +30,6 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
-
-    auth_basic "Караул";
-    auth_basic_user_file /etc/nginx/.htpasswd-__DEPLOYMENT_ID__;
 
     client_max_body_size 3m;
 
