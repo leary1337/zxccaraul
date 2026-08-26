@@ -30,6 +30,7 @@
 }
 
 html {
+  height: 100%;
   min-width: 320px;
   background:
     radial-gradient(circle at top left, rgba(233, 75, 47, .16), transparent 360px),
@@ -41,10 +42,16 @@ html {
 
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   background:
     linear-gradient(180deg, rgba(255, 212, 128, .04), transparent 280px),
     var(--bg);
+}
+
+#app {
+  min-height: 100%;
 }
 
 button,
@@ -65,13 +72,17 @@ button:disabled {
 }
 
 .app {
-  min-height: 100vh;
-  padding-bottom: calc(var(--nav-h) + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .topbar {
-  position: sticky;
-  top: 0;
+  position: relative;
+  flex: 0 0 auto;
   z-index: 20;
   display: flex;
   align-items: center;
@@ -123,9 +134,14 @@ button:disabled {
 }
 
 .main {
+  flex: 1 1 auto;
   width: min(100%, 1200px);
+  min-height: 0;
   margin: 0 auto;
-  padding: 14px 12px 96px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px 12px calc(24px + env(safe-area-inset-bottom));
 }
 
 .page-title {
@@ -545,10 +561,7 @@ h3 {
 }
 
 .bottom-nav {
-  position: fixed;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  flex: 0 0 auto;
   z-index: 30;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
