@@ -1,11 +1,31 @@
 const STORAGE_KEY = "caraul-state-v2";
 const AUTH_KEY = "caraul-auth-v1";
+const UI_STORAGE_KEY = "caraul-ui-v1";
 
 const views = [
   ["roster", "▦", "Раскладка"],
   ["stats", "▤", "Статистика"],
-  ["employees", "☷", "Сотрудники"]
+  ["employees", "☷", "Сотрудники"],
+  ["work", "⚒", "Работа"]
 ];
+
+const equipmentConditions = {
+  READY: { label: "Исправно", color: "green" },
+  MAINTENANCE: { label: "На обслуживании", color: "yellow" },
+  FAULTY: { label: "Неисправно", color: "orange" }
+};
+
+const defaultEquipmentGroups = {
+  GASI: "ГАСИ",
+  PTV: "ПТВ",
+  RHBZ: "РХБЗ",
+  MOTOR_PUMPS: "Мотопомпы",
+  CHAINSAWS: "Бензопилы"
+};
+
+function equipmentGroup(item) {
+  return Object.hasOwn(equipmentGroups, item.group) ? item.group : "PTV";
+}
 
 const absenceLabels = {
   DAY_OFF: "Отгул",
@@ -14,6 +34,36 @@ const absenceLabels = {
   BUSINESS_TRIP: "Командировка",
   SUBSTITUTE: "Подмена"
 };
+
+const vacationLabels = {
+  MATERNITY: "Декретный отпуск",
+  ANNUAL: "Основной отпуск",
+  VETERAN: "Ветеранский отпуск",
+  DONOR: "Донорский отпуск",
+  GOLDEN: "«Золотой» отпуск",
+  STUDY: "Учебный отпуск"
+};
+
+function absenceStatusLabel(absence) {
+  return (absence.absenceType === "VACATION" && vacationLabels[absence.vacationType])
+    || absenceLabels[absence.absenceType];
+}
+
+function employeeVacationPeriods(employee) {
+  if (Array.isArray(employee?.vacationPeriods)) return employee.vacationPeriods;
+  return employee?.vacationDateFrom && employee?.vacationDateTo
+    ? [{ dateFrom: employee.vacationDateFrom, dateTo: employee.vacationDateTo }]
+    : [];
+}
+
+function formatVacationPeriod(period) {
+  return `с ${formatShortDate(period.dateFrom)} по ${formatShortDate(period.dateTo)}`;
+}
+
+function vacationPeriodText(employee, date) {
+  const period = employeeVacationPeriods(employee).find((item) => dateInRange(date, item.dateFrom, item.dateTo));
+  return period ? formatVacationPeriod(period) : "";
+}
 
 const absenceColors = {
   DAY_OFF: "green",
@@ -69,6 +119,7 @@ const shortMonthNames = [
 
 const app = document.querySelector("#app");
 let state = loadState();
+let equipmentGroups = state.equipmentGroups;
 let authenticated = localStorage.getItem(AUTH_KEY) === "ok";
 let remoteStateLoaded = false;
 let persistTimer = 0;
@@ -88,10 +139,68 @@ let ui = {
     columns: ["dayOff", "sickLeave"]
   },
   employeeSearch: "",
+  equipmentSearch: "",
+  equipmentCondition: "",
+  equipmentSort: "asc",
+  equipmentGroup: "PTV",
   sending: false,
   renderedPng: "",
   pngStatus: ""
 };
+let savedUiScroll = { view: "", group: "", top: 0, left: 0 };
+let uiScrollTimer = 0;
+restoreUiState();
+
+function restoreUiState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(UI_STORAGE_KEY) || "null");
+    if (!saved || typeof saved !== "object") return;
+    const validDate = (value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && isoDate(parseIsoDate(value)) === value;
+    if (views.some(([view]) => view === saved.view)) ui.view = saved.view;
+    if (validDate(saved.selectedDate)) ui.selectedDate = saved.selectedDate;
+    for (const key of ["employeeSearch", "equipmentSearch"]) {
+      if (typeof saved[key] === "string") ui[key] = saved[key];
+    }
+    if (Object.hasOwn(equipmentGroups, saved.equipmentGroup)) ui.equipmentGroup = saved.equipmentGroup;
+    if (saved.equipmentCondition === "" || Object.hasOwn(equipmentConditions, saved.equipmentCondition)) ui.equipmentCondition = saved.equipmentCondition;
+    if (["asc", "desc"].includes(saved.equipmentSort)) ui.equipmentSort = saved.equipmentSort;
+    const stats = saved.stats;
+    if (stats && typeof stats === "object") {
+      for (const key of ["from", "to"]) if (validDate(stats[key])) ui.stats[key] = stats[key];
+      if (typeof stats.search === "string") ui.stats.search = stats.search;
+      if (typeof stats.onlyWithAbsences === "boolean") ui.stats.onlyWithAbsences = stats.onlyWithAbsences;
+      if (["", "name", "dayOff", "sickLeave", "total"].includes(stats.sortKey)) ui.stats.sortKey = stats.sortKey;
+      if (["asc", "desc"].includes(stats.sortDir)) ui.stats.sortDir = stats.sortDir;
+      if (stats.absenceType === "" || Object.hasOwn(absenceLabels, stats.absenceType)) ui.stats.absenceType = stats.absenceType;
+    }
+    if (saved.scroll?.view === ui.view && Number.isFinite(saved.scroll.top) && Number.isFinite(saved.scroll.left)) {
+      savedUiScroll = { view: ui.view, group: saved.scroll.group, top: Math.max(0, saved.scroll.top), left: Math.max(0, saved.scroll.left) };
+    }
+  } catch {
+    // An invalid or unavailable UI cache must not block the application.
+  }
+}
+
+function saveUiState() {
+  const main = app.querySelector(".main");
+  if (!main) return;
+  savedUiScroll = { view: ui.view, group: ui.equipmentGroup, top: main.scrollTop, left: main.scrollLeft };
+  try {
+    localStorage.setItem(UI_STORAGE_KEY, JSON.stringify({
+      view: ui.view,
+      selectedDate: ui.selectedDate,
+      employeeSearch: ui.employeeSearch,
+      equipmentSearch: ui.equipmentSearch,
+      equipmentCondition: ui.equipmentCondition,
+      equipmentSort: ui.equipmentSort,
+      equipmentGroup: ui.equipmentGroup,
+      stats: ui.stats,
+      scroll: savedUiScroll
+    }));
+  } catch {
+    // Keep the current page usable if browser storage is unavailable.
+  }
+}
 
 function makeShortName(lastName, firstName, middleName) {
   return `${lastName} ${firstName?.[0] || ""}.${middleName?.[0] || ""}.`;
@@ -107,6 +216,8 @@ function loadState() {
   return {
     appTitle: "Караул",
     employees: [],
+    equipment: [],
+    equipmentGroups: { ...defaultEquipmentGroups },
     absences: [],
     templateBlocks: [],
     rosters: {}
@@ -114,6 +225,12 @@ function loadState() {
 }
 
 function normalizeState(nextState) {
+  const savedGroups = nextState.equipmentGroups;
+  const validGroups = savedGroups && typeof savedGroups === "object" && !Array.isArray(savedGroups)
+    ? Object.entries(savedGroups).filter(([id, label]) => /^[A-Za-z0-9_-]+$/.test(id) && !["__proto__", "constructor", "prototype"].includes(id) && typeof label === "string" && label.trim())
+    : [];
+  nextState.equipmentGroups = { ...defaultEquipmentGroups, ...Object.fromEntries(validGroups.map(([id, label]) => [id, label.trim().slice(0, 60)])) };
+  nextState.equipment = Array.isArray(nextState.equipment) ? nextState.equipment : [];
   nextState.appTitle = String(nextState.appTitle || "Караул").trim() || "Караул";
   nextState.employees = nextState.employees.map((employee) => ({
     position: "",
@@ -175,6 +292,8 @@ async function loadStateFromServer() {
     remoteStateLoaded = true;
     if (Array.isArray(result.state?.employees)) {
       state = normalizeState(result.state);
+      equipmentGroups = state.equipmentGroups;
+      if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = "PTV";
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       normalizeStatsDates();
       render();
@@ -199,6 +318,12 @@ async function saveStateToServer() {
 }
 
 function render() {
+  const main = app.querySelector(".main");
+  const scrollPosition = main?.dataset.scrollView === ui.view
+    ? { top: main.scrollTop, left: main.scrollLeft }
+    : !main && savedUiScroll.view === ui.view && (ui.view !== "work" || savedUiScroll.group === ui.equipmentGroup)
+      ? savedUiScroll
+      : { top: 0, left: 0 };
   document.title = state.appTitle;
   if (!authenticated) {
     renderLogin();
@@ -216,7 +341,7 @@ function render() {
         </div>
         <nav class="desktop-nav" aria-label="Разделы">${renderNavItems()}</nav>
       </header>
-      <main class="main">${renderCurrentView()}</main>
+      <main class="main" data-scroll-view="${ui.view}">${renderCurrentView()}</main>
       <nav class="bottom-nav" aria-label="Разделы">${renderNavItems()}</nav>
       ${ui.sheet ? renderSheet() : ""}
       ${ui.modal ? renderModal() : ""}
@@ -224,6 +349,11 @@ function render() {
     </div>
   `;
   bindEvents();
+  // The scroll container is replaced on every render, including status changes.
+  const nextMain = app.querySelector(".main");
+  nextMain.scrollTop = scrollPosition.top;
+  nextMain.scrollLeft = scrollPosition.left;
+  saveUiState();
 }
 
 function renderLogin() {
@@ -267,6 +397,7 @@ function renderNavItems() {
 }
 
 function renderCurrentView() {
+  if (ui.view === "work") return renderWorkView();
   if (ui.view === "stats") return renderStatsView();
   if (ui.view === "employees") return renderEmployeesView();
   return renderRosterView();
@@ -474,7 +605,7 @@ function renderOthersPanel(roster) {
                   <span class="row-title">${escapeHtml(employee.shortName)}</span>
                   <span class="row-subtitle">${absence ? absencePeriodText(absence) : "Статус не указан"}</span>
                 </span>
-                <span class="chip ${absence ? absenceColors[absence.absenceType] : ""}">${absence ? absenceLabels[absence.absenceType] : "Указать"}</span>
+                <span class="chip ${absence ? absenceColors[absence.absenceType] : ""}">${absence ? absenceStatusLabel(absence) : "Указать"}</span>
               </button>
             `;
           }).join("") || `<div class="empty-state">Все активные сотрудники назначены.</div>`}
@@ -582,6 +713,7 @@ function renderEmployeesView() {
             <div>
               <div class="row-title">${escapeHtml(employee.shortName)} ${employee.isActive ? "" : `<span class="chip">Архив</span>`}</div>
               <div class="row-subtitle role-line">${employeeRoleHtml(employee)}</div>
+              ${employeeVacationPeriods(employee).map((period) => `<div class="row-subtitle">Отпуск ${formatVacationPeriod(period)}</div>`).join("")}
             </div>
             <button class="ghost-btn" data-edit-employee="${employee.id}" type="button">Изменить</button>
           </div>
@@ -589,6 +721,291 @@ function renderEmployeesView() {
       </div>
     </section>
   `;
+}
+
+function renderWorkView() {
+  const groupCount = state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup).length;
+  return `
+    <div class="page-title work-heading">
+      <div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
+      <div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>
+    </div>
+    <div class="equipment-tabs" role="tablist" aria-label="Разделы оборудования">${Object.entries(equipmentGroups).map(([key, label]) => `
+      <button class="equipment-tab ${ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
+    `).join("")}</div>
+    <section id="equipment-group-panel" role="tabpanel" aria-labelledby="equipment-tab-${ui.equipmentGroup}">
+    <div class="equipment-summary">
+      <div class="panel"><span class="muted small">Позиций в разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}»</span><strong>${groupCount}</strong></div>
+    </div>
+    <div class="equipment-filters">
+      <div class="field-group"><label for="equipment-search">Поиск по базе</label><input id="equipment-search" class="search" data-equipment-search type="search" placeholder="Название, номер или место хранения" value="${escapeAttr(ui.equipmentSearch)}" /></div>
+      <div class="field-group"><label for="equipment-condition-filter">Состояние</label><select id="equipment-condition-filter" class="field" data-equipment-condition><option value="">Все состояния</option>${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${ui.equipmentCondition === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
+      <div class="field-group"><label for="equipment-sort">По названию</label><select id="equipment-sort" class="field" data-equipment-sort><option value="asc" ${ui.equipmentSort === "asc" ? "selected" : ""}>А–Я</option><option value="desc" ${ui.equipmentSort === "desc" ? "selected" : ""}>Я–А</option></select></div>
+    </div>
+    <div data-equipment-results>${renderEquipmentResults()}</div>
+    </section>
+  `;
+}
+
+function equipmentInstances(item) {
+  const condition = Object.hasOwn(equipmentConditions, item.condition) ? item.condition : "READY";
+  if (Array.isArray(item.instances) && item.instances.length) {
+    return item.instances.map((instance) => ({
+      ...instance,
+      condition: Object.hasOwn(equipmentConditions, instance.condition) ? instance.condition : condition
+    }));
+  }
+  const quantity = Number.isSafeInteger(item.quantity) && item.quantity > 0 ? item.quantity : 1;
+  return Array.from({ length: quantity }, (_, index) => ({
+    inventoryNumber: index === 0 ? item.inventoryNumber || "" : "",
+    location: item.location || "",
+    condition
+  }));
+}
+
+function renderEquipmentResults() {
+  const query = ui.equipmentSearch.trim().toLocaleLowerCase("ru");
+  const groupItems = state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup);
+  const items = groupItems.map((item) => {
+    const allInstances = equipmentInstances(item);
+    const instances = allInstances.map((instance, index) => ({ ...instance, index }))
+      .filter((instance) => !ui.equipmentCondition || instance.condition === ui.equipmentCondition)
+      .filter((instance) => !query || [item.name, item.category, item.notes, instance.inventoryNumber, instance.location, equipmentConditions[instance.condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
+    return { item, instances, total: allInstances.length };
+  }).filter(({ instances }) => instances.length)
+    .sort((a, b) => (ui.equipmentSort === "desc" ? -1 : 1) * a.item.name.localeCompare(b.item.name, "ru", { numeric: true, sensitivity: "base" }));
+  if (!items.length) return `<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
+  return `
+    <p class="muted small" role="status">Найдено позиций: ${items.length}</p>
+    <div class="equipment-list">${items.map(({ item, instances, total }) => {
+      return `<article class="panel equipment-card">
+        <div class="equipment-card-heading"><h2>${escapeHtml(item.name)}</h2></div>
+        <dl class="equipment-details">
+          <div><dt>Количество</dt><dd>${total} ${escapeHtml(item.unit || "шт.")}</dd></div>
+          <div><dt>Категория</dt><dd>${escapeHtml(item.category || "Не указана")}</dd></div>
+        </dl>
+        ${instances.length < total ? `<p class="muted small">Показано экземпляров: ${instances.length} из ${total}</p>` : ""}
+        <ol class="equipment-instance-list">${instances.map((instance) => `<li>
+          <div class="equipment-card-heading"><strong>Экземпляр ${instance.index + 1}</strong><span class="chip ${equipmentConditions[instance.condition].color}">${equipmentConditions[instance.condition].label}</span></div>
+          <dl class="equipment-details">
+            <div><dt>Инвентарный / заводской номер</dt><dd>${escapeHtml(instance.inventoryNumber || "Не указан")}</dd></div>
+            <div><dt>Место хранения</dt><dd>${escapeHtml(instance.location || "Не указано")}</dd></div>
+          </dl>
+        </li>`).join("")}</ol>
+        ${item.notes ? `<p class="equipment-notes">${escapeHtml(item.notes)}</p>` : ""}
+        <button class="ghost-btn" data-edit-equipment="${escapeAttr(item.id)}" type="button" aria-label="Изменить: ${escapeAttr(item.name)}">Изменить</button>
+      </article>`;
+    }).join("")}</div>
+  `;
+}
+
+function renderEquipmentInstanceFields(instance = {}, index = 0) {
+  const fieldId = createId("equipment-instance");
+  return `<fieldset class="equipment-instance-fields" data-equipment-instance>
+    <legend>Экземпляр <span data-instance-number>${index + 1}</span></legend>
+    <div class="field-group"><label for="${fieldId}-number">Инвентарный / заводской номер</label><input id="${fieldId}-number" class="field" name="instanceNumber" maxlength="100" value="${escapeAttr(instance.inventoryNumber || "")}" /></div>
+    <div class="field-group"><label for="${fieldId}-location">Место хранения</label><input id="${fieldId}-location" class="field" name="instanceLocation" maxlength="160" value="${escapeAttr(instance.location || "")}" placeholder="Например: склад, стеллаж 2" /></div>
+    <div class="field-group"><label for="${fieldId}-condition">Состояние</label><select id="${fieldId}-condition" class="field" name="instanceCondition">${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${(instance.condition || "READY") === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
+    <button class="danger-btn" data-remove-instance type="button">Удалить экземпляр</button>
+  </fieldset>`;
+}
+
+function bindEquipmentInstances() {
+  const list = document.querySelector("[data-equipment-instances]");
+  if (!list) return;
+  const updateQuantity = () => {
+    const rows = list.querySelectorAll("[data-equipment-instance]");
+    document.querySelector("#equipment-quantity").value = rows.length;
+    rows.forEach((row, index) => {
+      row.querySelector("[data-instance-number]").textContent = index + 1;
+      row.querySelector("[data-remove-instance]").disabled = rows.length === 1;
+    });
+  };
+  document.querySelector("[data-add-instance]").addEventListener("click", () => {
+    list.insertAdjacentHTML("beforeend", renderEquipmentInstanceFields({}, list.children.length));
+    updateQuantity();
+    list.lastElementChild.querySelector("input").focus();
+  });
+  list.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-instance]");
+    if (!button || list.children.length <= 1) return;
+    button.closest("[data-equipment-instance]").remove();
+    updateQuantity();
+  });
+  updateQuantity();
+}
+
+function renderEquipmentFormModal() {
+  const item = state.equipment.find((entry) => entry.id === ui.modal.equipmentId);
+  const data = item || { quantity: 1, unit: "шт.", condition: "READY" };
+  const instances = equipmentInstances(data);
+  const group = item ? equipmentGroup(item) : ui.equipmentGroup;
+  return `
+    <div class="modal-backdrop"><form class="modal" data-equipment-form>
+      <div class="modal-head"><h2>${item ? "Карточка оборудования" : "Добавить оборудование"}</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть карточку оборудования">×</button></div>
+      <div class="modal-body">
+        <div class="field-group"><label for="equipment-group">Раздел</label><select id="equipment-group" class="field" name="group">${Object.entries(equipmentGroups).map(([key, label]) => `<option value="${key}" ${key === group ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></div>
+        <div class="field-group"><label for="equipment-name">Наименование</label><input id="equipment-name" class="field" name="name" required maxlength="160" value="${escapeAttr(data.name || "")}" placeholder="Например: пожарный рукав" /></div>
+        <div class="field-group"><label for="equipment-category">Категория</label><input id="equipment-category" class="field" name="category" maxlength="100" value="${escapeAttr(data.category || "")}" placeholder="Например: рукавное оборудование" /></div>
+        <div class="equipment-form-grid">
+          <div class="field-group"><label for="equipment-quantity">Количество</label><input id="equipment-quantity" class="field" name="quantity" type="number" readonly value="${instances.length}" /></div>
+          <div class="field-group"><label for="equipment-unit">Единица учёта</label><input id="equipment-unit" class="field" name="unit" required maxlength="20" value="${escapeAttr(data.unit || "шт.")}" placeholder="шт., комплект" /></div>
+        </div>
+        <p class="muted small">У каждого экземпляра — свой номер, место хранения и состояние. Количество рассчитывается автоматически.</p>
+        <div class="equipment-instances" data-equipment-instances>${instances.map(renderEquipmentInstanceFields).join("")}</div>
+        <button class="ghost-btn equipment-add-instance" data-add-instance type="button">+ Добавить экземпляр</button>
+        <div class="field-group"><label for="equipment-notes">Примечание</label><textarea id="equipment-notes" class="field" name="notes" maxlength="2000" placeholder="Комплектация, особенности, замечания">${escapeHtml(data.notes || "")}</textarea></div>
+        <p class="form-error small" data-equipment-error role="alert" hidden></p>
+        <div class="actions"><button class="btn" type="submit">Сохранить</button>${item ? `<button class="danger-btn" data-delete-equipment="${escapeAttr(item.id)}" type="button">Удалить</button>` : ""}</div>
+      </div>
+    </form></div>
+  `;
+}
+
+function renderEquipmentGroupField(id, label = "") {
+  return `<div class="field-group" data-group-row>
+    <input type="hidden" name="groupId" value="${escapeAttr(id)}" />
+    <label for="group-label-${id}">${label ? "Название раздела" : "Новый раздел"}</label>
+    <input id="group-label-${id}" class="field" name="groupLabel" value="${escapeAttr(label)}" required maxlength="60" placeholder="Например: Связь" />
+  </div>`;
+}
+
+function renderEquipmentGroupsModal() {
+  return `<div class="modal-backdrop"><form class="modal" data-equipment-groups-form>
+    <div class="modal-head"><h2>Разделы оборудования</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть настройку разделов">×</button></div>
+    <div class="modal-body">
+      <p class="muted small">Переименуйте разделы или добавьте свои. Оборудование останется в своём разделе.</p>
+      <div data-group-fields>${Object.entries(equipmentGroups).map(([id, label]) => renderEquipmentGroupField(id, label)).join("")}</div>
+      <p class="form-error small" data-groups-error role="alert" hidden></p>
+      <div class="actions"><button class="ghost-btn" data-add-equipment-group type="button">+ Добавить раздел</button><button class="btn" type="submit">Сохранить</button></div>
+    </div>
+  </form></div>`;
+}
+
+function bindEquipmentGroupsForm() {
+  const form = document.querySelector("[data-equipment-groups-form]");
+  if (!form) return;
+  form.querySelector("[data-add-equipment-group]").addEventListener("click", () => {
+    const fields = form.querySelector("[data-group-fields]");
+    fields.insertAdjacentHTML("beforeend", renderEquipmentGroupField(createId("group")));
+    fields.lastElementChild.querySelector('[name="groupLabel"]').focus();
+  });
+  form.addEventListener("input", () => { form.querySelector("[data-groups-error]").hidden = true; });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const ids = data.getAll("groupId");
+    const labels = data.getAll("groupLabel").map((label) => String(label).trim().replace(/\s+/g, " "));
+    const uniqueLabels = new Set(labels.map((label) => label.toLocaleLowerCase("ru")));
+    if (labels.some((label) => !label) || uniqueLabels.size !== labels.length) {
+      const error = form.querySelector("[data-groups-error]");
+      error.textContent = "Названия разделов должны быть заполнены и не повторяться.";
+      error.hidden = false;
+      return;
+    }
+    state.equipmentGroups = Object.fromEntries(ids.map((id, index) => [id, labels[index]]));
+    equipmentGroups = state.equipmentGroups;
+    persist();
+    ui.modal = null;
+    render();
+  });
+}
+
+function bindWorkEvents() {
+  document.querySelector("[data-manage-equipment-groups]")?.addEventListener("click", () => {
+    ui.modal = { type: "equipmentGroups" };
+    render();
+  });
+  document.querySelectorAll("[data-equipment-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (ui.equipmentGroup === button.dataset.equipmentGroup) return;
+      ui.equipmentGroup = button.dataset.equipmentGroup;
+      ui.equipmentSearch = "";
+      ui.equipmentCondition = "";
+      render();
+      app.querySelector(".main").scrollTop = 0;
+      saveUiState();
+      document.querySelector(`[data-equipment-group="${ui.equipmentGroup}"]`).focus({ preventScroll: true });
+    });
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const groups = Object.keys(equipmentGroups);
+      const index = groups.indexOf(button.dataset.equipmentGroup);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? groups.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + groups.length) % groups.length;
+      document.querySelector(`[data-equipment-group="${groups[next]}"]`).click();
+    });
+  });
+  document.querySelector("[data-add-equipment]")?.addEventListener("click", () => {
+    ui.modal = { type: "equipmentForm" };
+    render();
+  });
+  document.querySelector("[data-equipment-search]")?.addEventListener("input", (event) => {
+    ui.equipmentSearch = event.target.value;
+    document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
+    saveUiState();
+  });
+  document.querySelector("[data-equipment-condition]")?.addEventListener("change", (event) => {
+    ui.equipmentCondition = event.target.value;
+    document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
+    saveUiState();
+  });
+  document.querySelector("[data-equipment-sort]")?.addEventListener("change", (event) => {
+    ui.equipmentSort = event.target.value;
+    document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
+    saveUiState();
+  });
+  document.querySelector("[data-equipment-results]")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-edit-equipment]");
+    if (!button) return;
+    ui.modal = { type: "equipmentForm", equipmentId: button.dataset.editEquipment };
+    render();
+  });
+}
+
+function saveEquipmentFromForm(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const values = Object.fromEntries(["name", "group", "category", "unit", "notes"].map((key) => [key, String(form.get(key) || "").trim()]));
+  const locations = form.getAll("instanceLocation");
+  const conditions = form.getAll("instanceCondition");
+  const instances = form.getAll("instanceNumber").map((inventoryNumber, index) => ({
+    inventoryNumber: String(inventoryNumber || "").trim(),
+    location: String(locations[index] || "").trim(),
+    condition: String(conditions[index] || "")
+  }));
+  const quantity = instances.length;
+  if (!values.name || !values.unit || !Object.hasOwn(equipmentGroups, values.group) || !Number.isSafeInteger(quantity) || quantity < 1 || instances.some((instance) => !Object.hasOwn(equipmentConditions, instance.condition))) {
+    const error = event.currentTarget.querySelector("[data-equipment-error]");
+    error.textContent = "Укажите название, единицу учёта и добавьте хотя бы один экземпляр с выбранным состоянием.";
+    error.hidden = false;
+    return;
+  }
+  const existing = state.equipment.find((item) => item.id === ui.modal.equipmentId);
+  const now = new Date().toISOString();
+  if (existing) {
+    Object.assign(existing, values, { instances, quantity, updatedAt: now });
+    delete existing.inventoryNumber;
+    delete existing.location;
+    delete existing.condition;
+  } else state.equipment.push({ id: createId("equipment"), ...values, instances, quantity, createdAt: now, updatedAt: now });
+  if (ui.equipmentGroup !== values.group) {
+    ui.equipmentGroup = values.group;
+    ui.equipmentSearch = "";
+    ui.equipmentCondition = "";
+  }
+  persist();
+  ui.modal = null;
+  render();
+}
+
+function deleteEquipment(id) {
+  const item = state.equipment.find((entry) => entry.id === id);
+  if (!item || !window.confirm(`Удалить «${item.name}» из базы ПТВ?`)) return;
+  state.equipment = state.equipment.filter((entry) => entry.id !== id);
+  persist();
+  ui.modal = null;
+  render();
 }
 
 function renderSheet() {
@@ -733,7 +1150,7 @@ function renderEmployeePickerSheet() {
               const isCurrentSlot = selectedIn.some((item) => item.assignmentType === assignmentType && item.position === position);
               const marker = selectedIn.length
                 ? selectedIn.map((item) => item.assignmentType === assignmentType && item.position === position ? "Выбран здесь" : assignmentTitle(item.assignmentType)).join(", ")
-                : absence ? absenceLabels[absence.absenceType] : "";
+                : absence ? absenceStatusLabel(absence) : "";
               const className = selectedIn.length ? "selected" : absence ? "warn" : "";
               return `
                 <button class="picker-option ${className}" data-select-employee="${employee.id}" type="button">
@@ -755,19 +1172,23 @@ function renderEmployeePickerSheet() {
 function renderStatusPickerSheet() {
   const employee = findEmployee(ui.sheet.employeeId);
   const active = getAbsenceForDate(employee.id, ui.selectedDate);
+  const choosingVacation = ui.sheet.choosingVacation;
   return `
     <div class="sheet-backdrop" data-close-sheet>
       <section class="sheet" data-stop>
         <div class="sheet-head">
           <div>
-            <h2>Статус: ${escapeHtml(employee.shortName)}</h2>
+            <h2>${choosingVacation ? "Вид отпуска" : "Статус"}: ${escapeHtml(employee.shortName)}</h2>
             <div class="muted small">${formatLongDate(ui.selectedDate)}</div>
           </div>
           <button class="icon-btn" data-close-sheet type="button">×</button>
         </div>
         <div class="sheet-body">
+          ${choosingVacation ? `<button class="ghost-btn vacation-back" data-back-to-status type="button">← Все статусы</button>` : ""}
           <div class="status-grid">
-            ${Object.entries(absenceLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === key ? "active" : ""}" data-set-status="${key}" type="button">${label}</button>`).join("")}
+            ${choosingVacation
+              ? Object.entries(vacationLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === "VACATION" && active.vacationType === key ? "active" : ""}" data-set-vacation="${key}" aria-pressed="${active?.absenceType === "VACATION" && active.vacationType === key}" type="button">${label}</button>`).join("")
+              : Object.entries(absenceLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === key ? "active" : ""}" data-set-status="${key}" type="button">${label}${key === "VACATION" ? " ›" : ""}</button>`).join("")}
           </div>
           <div class="actions status-actions">
             <button class="danger-btn" data-clear-status type="button">Очистить статус</button>
@@ -779,6 +1200,8 @@ function renderStatusPickerSheet() {
 }
 
 function renderModal() {
+  if (ui.modal.type === "equipmentGroups") return renderEquipmentGroupsModal();
+  if (ui.modal.type === "equipmentForm") return renderEquipmentFormModal();
   if (ui.modal.type === "preview") return renderPreviewModal();
   if (ui.modal.type === "titleForm") return renderTitleFormModal();
   if (ui.modal.type === "blockForm") return renderBlockFormModal();
@@ -851,6 +1274,120 @@ function renderTitleFormModal() {
   `;
 }
 
+function renderVacationRangeCalendar({ month: value, from, to }) {
+  const monthDate = parseIsoDate(value);
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+  const leading = (new Date(year, month, 1).getDay() + 6) % 7;
+  const days = new Date(year, month + 1, 0).getDate();
+  const today = isoDate(new Date());
+  return `
+    <div class="calendar-nav">
+      <button class="icon-btn" data-vacation-month="-1" type="button" aria-label="Предыдущий месяц">‹</button>
+      <strong aria-live="polite">${monthNames[month]} ${year}</strong>
+      <button class="icon-btn" data-vacation-month="1" type="button" aria-label="Следующий месяц">›</button>
+    </div>
+    <div class="calendar-weekdays">${["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((day) => `<span>${day}</span>`).join("")}</div>
+    <div class="calendar-grid">
+      ${'<span class="calendar-empty"></span>'.repeat(leading)}
+      ${Array.from({ length: days }, (_, index) => {
+        const date = isoDate(new Date(year, month, index + 1));
+        const edge = date === from || date === to;
+        return `<button class="calendar-day ${date === today ? "today" : ""} ${edge ? "selected" : ""} ${from && to && date > from && date < to ? "in-range" : ""}" data-vacation-day="${date}" aria-label="${formatLongDate(date)}" aria-pressed="${edge || Boolean(from && to && date > from && date < to)}" type="button">${index + 1}</button>`;
+      }).join("")}
+    </div>
+    <p class="muted small" aria-live="polite">${from && !to ? `Начало: ${formatShortDate(from)}. Выберите окончание отпуска.` : "Выберите начало и окончание отпуска."}</p>
+    <div class="actions">
+      <button class="ghost-btn" data-vacation-cancel type="button">Отмена</button>
+      <button class="danger-btn" data-vacation-clear type="button">Очистить даты</button>
+    </div>
+  `;
+}
+
+function renderVacationPeriodFields(period = {}) {
+  const calendarId = createId("vacation-calendar");
+  return `
+    <div class="vacation-period-fields" data-vacation-period role="group" aria-label="Период отпуска">
+      <input type="hidden" name="vacationDateFrom" value="${escapeAttr(period.dateFrom || "")}" />
+      <input type="hidden" name="vacationDateTo" value="${escapeAttr(period.dateTo || "")}" />
+      <div class="vacation-period-actions">
+        <button class="field vacation-range-trigger" data-vacation-range type="button" aria-expanded="false" aria-controls="${calendarId}">${period.dateFrom && period.dateTo ? `${formatShortDate(period.dateFrom)} — ${formatShortDate(period.dateTo)}` : "Выбрать даты отпуска"}</button>
+        <button class="icon-btn" data-remove-vacation type="button" aria-label="Удалить отпуск">×</button>
+      </div>
+      <div id="${calendarId}" class="vacation-range-calendar" role="group" aria-label="Диапазон отпуска" hidden></div>
+    </div>
+  `;
+}
+
+function bindVacationPeriods() {
+  const list = document.querySelector("[data-vacation-periods]");
+  if (!list) return;
+  list.querySelectorAll("[data-vacation-period]").forEach(bindVacationRangePicker);
+  document.querySelector("[data-add-vacation]").addEventListener("click", () => {
+    list.insertAdjacentHTML("beforeend", renderVacationPeriodFields());
+    bindVacationRangePicker(list.lastElementChild);
+    list.lastElementChild.querySelector("[data-vacation-range]").click();
+  });
+}
+
+function bindVacationRangePicker(root) {
+  const trigger = root.querySelector("[data-vacation-range]");
+  const calendar = root.querySelector(".vacation-range-calendar");
+  const fromInput = root.querySelector('[name="vacationDateFrom"]');
+  const toInput = root.querySelector('[name="vacationDateTo"]');
+  let draft;
+  root.querySelector("[data-remove-vacation]").addEventListener("click", () => {
+    root.remove();
+    document.querySelector("[data-vacation-error]").hidden = true;
+    document.querySelector("[data-add-vacation]").focus({ preventScroll: true });
+  });
+  const close = () => {
+    calendar.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.focus({ preventScroll: true });
+  };
+  const commit = (from, to) => {
+    fromInput.value = from;
+    toInput.value = to;
+    trigger.textContent = from && to ? `${formatShortDate(from)} — ${formatShortDate(to)}` : "Выбрать даты отпуска";
+    document.querySelector("[data-vacation-error]").hidden = true;
+    close();
+  };
+  trigger.addEventListener("click", () => {
+    if (!calendar.hidden) return close();
+    draft = { month: fromInput.value || ui.selectedDate, from: fromInput.value, to: toInput.value };
+    calendar.innerHTML = renderVacationRangeCalendar(draft);
+    calendar.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+  });
+  calendar.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    }
+  });
+  calendar.addEventListener("click", (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    if (button.hasAttribute("data-vacation-cancel")) return close();
+    if (button.hasAttribute("data-vacation-clear")) return commit("", "");
+    if (button.dataset.vacationMonth) {
+      const current = parseIsoDate(draft.month);
+      draft.month = isoDate(new Date(current.getFullYear(), current.getMonth() + Number(button.dataset.vacationMonth), 1));
+    } else if (button.dataset.vacationDay) {
+      const date = button.dataset.vacationDay;
+      if (draft.from && !draft.to) return commit(draft.from < date ? draft.from : date, draft.from < date ? date : draft.from);
+      draft.from = date;
+      draft.to = "";
+    } else return;
+    calendar.innerHTML = renderVacationRangeCalendar(draft);
+    const selector = button.dataset.vacationMonth
+      ? `[data-vacation-month="${button.dataset.vacationMonth}"]`
+      : `[data-vacation-day="${button.dataset.vacationDay}"]`;
+    calendar.querySelector(selector)?.focus({ preventScroll: true });
+  });
+}
+
 function renderEmployeeFormModal() {
   const employee = ui.modal.employeeId ? findEmployee(ui.modal.employeeId) : null;
   const fallback = { lastName: "", firstName: "", middleName: "", position: "", additionalProfession: "", comment: "", isActive: true };
@@ -868,6 +1405,13 @@ function renderEmployeeFormModal() {
           <div class="field-group"><label>Отчество</label><input class="field" name="middleName" value="${escapeAttr(data.middleName)}" /></div>
           <div class="field-group"><label>Должность</label><input class="field" name="position" value="${escapeAttr(data.position || "")}" placeholder="Например: пожарный, водитель" /></div>
           <div class="field-group"><label>Доп. профессия</label><input class="field" name="additionalProfession" value="${escapeAttr(data.additionalProfession || "")}" placeholder="Например: ГДЗС, электрик, стропальщик" /></div>
+          <fieldset class="vacation-dates">
+            <legend>Отпуска</legend>
+            <div class="vacation-periods" data-vacation-periods>${employeeVacationPeriods(data).map(renderVacationPeriodFields).join("")}</div>
+            <button class="ghost-btn" data-add-vacation type="button">+ Добавить отпуск</button>
+            <p class="muted small">Добавьте периоды отпуска. При статусе «Отпуск» в PNG отображается период, в который попадает дата раскладки.</p>
+            <p class="form-error small" data-vacation-error role="alert" hidden></p>
+          </fieldset>
           <div class="field-group"><label>Комментарий</label><textarea class="field" name="comment">${escapeHtml(data.comment || "")}</textarea></div>
           <div class="actions">
             <button class="btn" type="submit">Сохранить</button>
@@ -895,6 +1439,7 @@ function bindEvents() {
   bindRosterEvents();
   bindStatsEvents();
   bindEmployeeEvents();
+  bindWorkEvents();
   bindSheetEvents();
   bindModalEvents();
 }
@@ -1004,8 +1549,20 @@ function bindSheetEvents() {
     attemptAssign(button.dataset.selectEmployee);
   }));
   document.querySelectorAll("[data-set-status]").forEach((button) => button.addEventListener("click", () => {
+    if (button.dataset.setStatus === "VACATION") {
+      ui.sheet.choosingVacation = true;
+      render();
+      return;
+    }
     setAbsenceStatus(button.dataset.setStatus);
   }));
+  document.querySelectorAll("[data-set-vacation]").forEach((button) => button.addEventListener("click", () => {
+    setAbsenceStatus("VACATION", button.dataset.setVacation);
+  }));
+  document.querySelector("[data-back-to-status]")?.addEventListener("click", () => {
+    ui.sheet.choosingVacation = false;
+    render();
+  });
   document.querySelector("[data-clear-status]")?.addEventListener("click", () => {
     clearAbsenceStatus(ui.sheet.employeeId, ui.selectedDate);
     ui.sheet = null;
@@ -1062,6 +1619,11 @@ function bindModalEvents() {
   document.querySelector("[data-title-form]")?.addEventListener("submit", saveTitleFromForm);
   document.querySelector("[data-block-form]")?.addEventListener("submit", saveBlockFromForm);
   document.querySelector("[data-employee-form]")?.addEventListener("submit", saveEmployeeFromForm);
+  document.querySelector("[data-equipment-form]")?.addEventListener("submit", saveEquipmentFromForm);
+  bindEquipmentInstances();
+  bindEquipmentGroupsForm();
+  document.querySelector("[data-delete-equipment]")?.addEventListener("click", (event) => deleteEquipment(event.currentTarget.dataset.deleteEquipment));
+  bindVacationPeriods();
   document.querySelector("[data-delete-employee]")?.addEventListener("click", (event) => {
     deleteEmployee(event.currentTarget.dataset.deleteEmployee);
   });
@@ -1081,12 +1643,15 @@ function assignEmployee(employeeId, assignmentType, position) {
   });
 }
 
-function setAbsenceStatus(absenceType) {
+function setAbsenceStatus(absenceType, vacationType) {
+  if (absenceType === "VACATION" && !Object.hasOwn(vacationLabels, vacationType)) return;
   const employeeId = ui.sheet.employeeId;
   const active = getAbsenceForDate(employeeId, ui.selectedDate);
 
   if (active) {
     active.absenceType = absenceType;
+    if (absenceType === "VACATION") active.vacationType = vacationType;
+    else delete active.vacationType;
     active.dateFrom = ui.selectedDate;
     active.dateTo = ui.selectedDate;
     active.updatedAt = new Date().toISOString();
@@ -1095,6 +1660,7 @@ function setAbsenceStatus(absenceType) {
       id: createId("absence"),
       employeeId,
       absenceType,
+      ...(absenceType === "VACATION" ? { vacationType } : {}),
       dateFrom: ui.selectedDate,
       dateTo: ui.selectedDate,
       comment: "",
@@ -1200,7 +1766,7 @@ function saveTitleFromForm(event) {
 function rosterData(roster) {
   const personData = (id) => {
     const employee = findEmployee(id);
-    return employee ? { name: employee.shortName, position: employee.position || "", lastName: employee.lastName || "" } : null;
+    return employee ? { name: employee.shortName, position: employee.position || "", additionalProfession: employee.additionalProfession || "", lastName: employee.lastName || "" } : null;
   };
   normalizeRoster(roster);
   const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId));
@@ -1214,7 +1780,8 @@ function rosterData(roster) {
       name: item.employee.shortName,
       position: item.employee.position || "",
       lastName: item.employee.lastName || "",
-      status: absenceLabels[item.absence.absenceType],
+      status: absenceStatusLabel(item.absence),
+      vacationPeriod: item.absence.absenceType === "VACATION" ? vacationPeriodText(item.employee, roster.date) : "",
       absenceType: item.absence.absenceType
     }));
   return {
@@ -1269,7 +1836,8 @@ function generateClientPng(data) {
       rows: data.absent.map((item) => [
         personName(item),
         item.status,
-        item.position || ""
+        item.position || "",
+        item.vacationPeriod || ""
       ])
     });
   }
@@ -1369,12 +1937,12 @@ function measureCanvasSection(ctx, section, width = 908) {
     const lines = wrapCanvasLines(ctx, section.text || "", width - 28);
     return headerHeight + lines.length * 42 + 52;
   }
-  return headerHeight + section.rows.reduce((sum, [label, value, position]) => {
+  return headerHeight + section.rows.reduce((sum, [label, value, position, vacationPeriod]) => {
     ctx.font = "800 34px Arial, sans-serif";
-    const labelLines = wrapCanvasLines(ctx, position ? `${label} (${position})` : label, width - 210);
+    const labelLines = wrapCanvasLines(ctx, position ? `${label} (${position})` : label, width - 330);
     ctx.font = "800 34px Arial, sans-serif";
-    const valueLines = wrapCanvasLines(ctx, value || "Не назначено", 180);
-    return sum + Math.max(labelLines.length * 42, valueLines.length * 42) + 30;
+    const valueLines = wrapCanvasLines(ctx, value || "Не назначено", 300);
+    return sum + Math.max(labelLines.length * 42, valueLines.length * 42) + (vacationPeriod ? 34 : 0) + 30;
   }, 0) + 36;
 }
 
@@ -1469,19 +2037,24 @@ function drawRowsSection(ctx, title, rows, x, y, color, width = 908) {
   const height = measureCanvasSection(ctx, { type: "rows", title, rows }, width);
   drawCanvasPanel(ctx, x, top, width, height);
   y = drawSectionHeader(ctx, title, x, y, color, width);
-  rows.forEach(([label, value, position]) => {
+  rows.forEach(([label, value, position, vacationPeriod]) => {
     ctx.fillStyle = "#fff8ef";
     ctx.font = "800 34px Arial, sans-serif";
-    const labelLines = wrapCanvasLines(ctx, position ? `${label} (${position})` : label, width - 210);
+    const labelLines = wrapCanvasLines(ctx, position ? `${label} (${position})` : label, width - 330);
     labelLines.forEach((line, index) => ctx.fillText(line, x, y + index * 42));
     let rowHeight = labelLines.length * 42;
     ctx.fillStyle = "#dff6ff";
     ctx.font = "800 34px Arial, sans-serif";
     ctx.textAlign = "right";
-    const valueLines = wrapCanvasLines(ctx, value || "Не назначено", 180);
+    const valueLines = wrapCanvasLines(ctx, value || "Не назначено", 300);
     valueLines.forEach((line, index) => ctx.fillText(line, x + width, y + index * 42));
     ctx.textAlign = "left";
     rowHeight = Math.max(rowHeight, valueLines.length * 42);
+    if (vacationPeriod) {
+      ctx.font = "650 24px Arial, sans-serif";
+      ctx.fillText(vacationPeriod, x, y + rowHeight + 4);
+      rowHeight += 34;
+    }
     y += rowHeight + 30;
   });
   return y + 34;
@@ -1713,12 +2286,29 @@ function statsRangeCalendarMonth() {
 function saveEmployeeFromForm(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
+  const vacationEnds = form.getAll("vacationDateTo");
+  const vacationPeriods = form.getAll("vacationDateFrom")
+    .map((dateFrom, index) => ({ dateFrom: String(dateFrom), dateTo: String(vacationEnds[index] || "") }))
+    .filter((period) => period.dateFrom || period.dateTo)
+    .sort((a, b) => a.dateFrom.localeCompare(b.dateFrom));
+  const vacationError = event.currentTarget.querySelector("[data-vacation-error]");
+  const error = vacationPeriods.some((period) => !period.dateFrom || !period.dateTo || period.dateFrom > period.dateTo)
+    ? "Выберите начало и окончание каждого отпуска."
+    : vacationPeriods.some((period, index) => index > 0 && period.dateFrom <= vacationPeriods[index - 1].dateTo)
+      ? "Периоды отпусков не должны пересекаться. Проверьте выбранные даты."
+      : "";
+  vacationError.textContent = error;
+  vacationError.hidden = !error;
+  if (error) return;
   const employee = ui.modal.employeeId ? findEmployee(ui.modal.employeeId) : { id: createId("employee"), createdAt: new Date().toISOString() };
   employee.lastName = String(form.get("lastName") || "").trim();
   employee.firstName = String(form.get("firstName") || "").trim();
   employee.middleName = String(form.get("middleName") || "").trim();
   employee.position = String(form.get("position") || "").trim();
   employee.additionalProfession = String(form.get("additionalProfession") || "").trim();
+  employee.vacationPeriods = vacationPeriods;
+  delete employee.vacationDateFrom;
+  delete employee.vacationDateTo;
   employee.shortName = makeShortName(employee.lastName, employee.firstName, employee.middleName);
   employee.isActive = true;
   employee.comment = String(form.get("comment") || "");
@@ -1818,9 +2408,15 @@ function isDriverPosition(position) {
 }
 
 function comparePeopleForRosterCard(a, b) {
+  const rtpDiff = Number(hasRtpProfession(b.additionalProfession)) - Number(hasRtpProfession(a.additionalProfession));
+  if (rtpDiff) return rtpDiff;
   const driverDiff = Number(isDriverPosition(a.position)) - Number(isDriverPosition(b.position));
   if (driverDiff) return driverDiff;
   return String(a.lastName || a.name || "").localeCompare(String(b.lastName || b.name || ""), "ru");
+}
+
+function hasRtpProfession(profession) {
+  return /(^|[^\p{L}\p{N}])ртп(?=$|[^\p{L}\p{N}])/iu.test(String(profession || ""));
 }
 
 function compareEmployeesByName(a, b) {
@@ -1896,8 +2492,8 @@ function formatShortDate(value) {
 }
 
 function absencePeriodText(absence) {
-  if (absence.dateFrom === absence.dateTo) return `${absenceLabels[absence.absenceType]} на день`;
-  return `${absenceLabels[absence.absenceType]} до ${formatShortDate(absence.dateTo)}`;
+  if (absence.dateFrom === absence.dateTo) return `${absenceStatusLabel(absence)} на день`;
+  return `${absenceStatusLabel(absence)} до ${formatShortDate(absence.dateTo)}`;
 }
 
 function dateInRange(date, from, to) {
@@ -1934,7 +2530,19 @@ function showToast(message) {
   }, 2600);
 }
 
-window.addEventListener("beforeunload", persist);
+app.addEventListener("scroll", (event) => {
+  if (!event.target.classList?.contains("main")) return;
+  window.clearTimeout(uiScrollTimer);
+  uiScrollTimer = window.setTimeout(saveUiState, 100);
+}, true);
+window.addEventListener("beforeunload", () => {
+  saveUiState();
+  persist();
+});
+window.addEventListener("pagehide", saveUiState);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") saveUiState();
+});
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});

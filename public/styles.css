@@ -577,7 +577,7 @@ h3 {
   flex: 0 0 auto;
   z-index: 30;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   height: calc(var(--nav-h) + env(safe-area-inset-bottom));
   padding-bottom: env(safe-area-inset-bottom);
   border-top: 1px solid var(--line);
@@ -604,6 +604,168 @@ h3 {
 
 .nav-item.active {
   color: var(--primary);
+}
+
+.work-heading {
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.work-heading h1 {
+  margin-bottom: 6px;
+}
+
+.work-heading p {
+  margin: 0;
+}
+
+.equipment-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.equipment-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.equipment-tab {
+  flex: 1 1 auto;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-weight: 760;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.equipment-tab.active {
+  border-color: var(--primary);
+  background: #3a211b;
+  color: #ffb4a5;
+}
+
+.equipment-tab:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.equipment-summary .panel {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.equipment-summary strong {
+  font-size: 28px;
+}
+
+.equipment-filters,
+.equipment-list {
+  display: grid;
+  gap: 12px;
+}
+
+.equipment-card {
+  min-width: 0;
+  padding: 16px;
+}
+
+.equipment-card-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.equipment-card h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.equipment-details,
+.equipment-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.equipment-details dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.equipment-details dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.equipment-notes {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.equipment-form-grid .field {
+  min-width: 0;
+}
+
+.equipment-instance-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 16px;
+}
+
+.equipment-instance-list li {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.equipment-instance-list strong {
+  font-size: 13px;
+}
+
+.equipment-instances {
+  display: grid;
+  gap: 12px;
+}
+
+.equipment-instance-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.equipment-instance-fields legend {
+  padding: 0 6px;
+  font-weight: 760;
+}
+
+.equipment-add-instance {
+  margin: 12px 0 18px;
+}
+
+@media (min-width: 1000px) {
+  .equipment-filters {
+    grid-template-columns: minmax(0, 1fr) 220px 140px;
+  }
+
+  .equipment-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .sheet-backdrop,
@@ -728,6 +890,75 @@ textarea.field {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.vacation-back {
+  margin-bottom: 12px;
+}
+
+.vacation-dates {
+  min-width: 0;
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.vacation-dates legend {
+  padding: 0 6px;
+  font-weight: 760;
+}
+
+.vacation-dates .field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.vacation-range-trigger {
+  color: var(--text);
+  text-align: left;
+}
+
+.vacation-periods {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.vacation-period-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 6px;
+  align-items: center;
+}
+
+.vacation-period-actions .vacation-range-trigger {
+  padding: 8px;
+  font-size: 13px;
+}
+
+.vacation-period-actions .icon-btn {
+  min-width: 0;
+  min-height: 36px;
+  padding: 0;
+}
+
+.vacation-range-calendar {
+  margin-top: 12px;
+}
+
+.vacation-range-calendar .calendar-nav {
+  gap: 6px;
+  font-size: 14px;
+}
+
+.vacation-range-calendar .calendar-day {
+  min-width: 0;
+  min-height: 38px;
+}
+
+.form-error {
+  color: var(--danger);
 }
 
 .calendar-nav {

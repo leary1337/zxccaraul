@@ -198,9 +198,15 @@ function isDriverPosition(position) {
 }
 
 function compareRosterPeople(a, b) {
+  const rtpDiff = Number(hasRtpProfession(b?.additionalProfession)) - Number(hasRtpProfession(a?.additionalProfession));
+  if (rtpDiff) return rtpDiff;
   const driverDiff = Number(isDriverPosition(personPosition(a))) - Number(isDriverPosition(personPosition(b)));
   if (driverDiff) return driverDiff;
   return String(a?.lastName || personName(a)).localeCompare(String(b?.lastName || personName(b)), "ru");
+}
+
+function hasRtpProfession(profession) {
+  return /(^|[^\p{L}\p{N}])ртп(?=$|[^\p{L}\p{N}])/iu.test(String(profession || ""));
 }
 
 function compareAbsentItems(a, b) {
@@ -212,7 +218,8 @@ function compareAbsentItems(a, b) {
 
 function sectionHeight(section) {
   if (section.kind === "comment") return 170 + Math.ceil(String(section.text || "").length / 42) * 42;
-  return 118 + Math.max(1, section.kind === "absent" ? section.items.length : section.people.length) * (section.kind === "absent" ? 82 : 76);
+  return 118 + Math.max(1, section.kind === "absent" ? section.items.length : section.people.length) * (section.kind === "absent" ? 82 : 76)
+    + (section.kind === "absent" ? section.items.filter((item) => item.absenceType === "VACATION" && item.vacationPeriod).length * 34 : 0);
 }
 
 function distributeSections(sections) {
@@ -245,7 +252,10 @@ function renderSection(section) {
               <strong>${escapeHtml(personName(item))}</strong>
               ${personPosition(item) ? `<small>(${escapeHtml(personPosition(item))})</small>` : ""}
             </div>
-            <span class="badge">${escapeHtml(item.status || "")}</span>
+            <div class="absence-status">
+              <span class="badge">${escapeHtml(item.status || "")}</span>
+              ${item.absenceType === "VACATION" && item.vacationPeriod ? `<small class="vacation-period">${escapeHtml(item.vacationPeriod)}</small>` : ""}
+            </div>
           </div>
         `).join("")}
       </section>
@@ -493,6 +503,17 @@ function renderDutyRosterVkCard(data) {
       font-weight: 650;
       text-align: left;
       overflow-wrap: anywhere;
+    }
+    .absence-status {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .vacation-period {
+      color: #dff6ff;
+      font-size: 20px;
+      white-space: nowrap;
     }
     .badge {
       align-self: center;
