@@ -1578,11 +1578,13 @@ function renderEmployeePickerSheet() {
   const reserveHistory = isReservePicker ? reserveDriverHistoryBefore(ui.selectedDate) : new Map();
   const eligibleEmployees = state.employees
     .filter((employee) => employee.isActive)
-    .filter((employee) => !isReservePicker || (isDriverPosition(employee.position) && !getAbsenceForDate(employee.id, ui.selectedDate)))
+    .filter((employee) => !isReservePicker || isDriverPosition(employee.position))
     .sort((a, b) => {
       if (isReservePicker) {
         const currentDiff = Number(b.id === currentId) - Number(a.id === currentId);
         if (currentDiff) return currentDiff;
+        const absenceDiff = Number(Boolean(getAbsenceForDate(a.id, ui.selectedDate))) - Number(Boolean(getAbsenceForDate(b.id, ui.selectedDate)));
+        if (absenceDiff) return absenceDiff;
         const aLastDate = reserveHistory.get(a.id) || "";
         const bLastDate = reserveHistory.get(b.id) || "";
         const historyDiff = aLastDate.localeCompare(bLastDate);
@@ -1595,7 +1597,8 @@ function renderEmployeePickerSheet() {
       return a.lastName.localeCompare(b.lastName, "ru");
     });
   const recommendedId = isReservePicker
-    ? eligibleEmployees.find((employee) => employee.id !== currentId)?.id || (currentId ? "" : eligibleEmployees[0]?.id)
+    ? eligibleEmployees.find((employee) => employee.id !== currentId && !getAbsenceForDate(employee.id, ui.selectedDate))?.id
+      || (!currentId ? eligibleEmployees.find((employee) => !getAbsenceForDate(employee.id, ui.selectedDate))?.id : "")
     : "";
   const rows = eligibleEmployees.filter((employee) => !query || employeeSearchText(employee).includes(query.toLowerCase()));
 
@@ -1611,7 +1614,7 @@ function renderEmployeePickerSheet() {
         </div>
         <div class="sheet-body">
           <input class="search" data-picker-search placeholder="Поиск по фамилии" value="${escapeAttr(query)}" />
-          ${isReservePicker ? `<p class="picker-hint">Показаны водители без отсутствия на выбранную дату. Первыми идут те, кто ещё не был резервным или был им раньше остальных.</p>` : ""}
+          ${isReservePicker ? `<p class="picker-hint">Показаны все активные водители. Доступные идут первыми, а водители с отсутствием отмечены статусом. Очередность учитывает дату последнего резерва.</p>` : ""}
           ${currentId ? `<button class="danger-btn" data-clear-assignment type="button" style="width:100%;margin-top:10px">Очистить назначение</button>` : ""}
           <div class="picker-list">
             ${rows.map((employee) => {
@@ -1633,7 +1636,7 @@ function renderEmployeePickerSheet() {
                   ${(marker || employee.id === recommendedId) ? `<span class="picker-chips">${employee.id === recommendedId ? `<span class="chip green">Следующий</span>` : ""}${marker ? `<span class="chip">${marker}</span>` : ""}</span>` : ""}
                 </button>
               `;
-            }).join("") || `<div class="empty-state">${isReservePicker ? "Нет доступных водителей без отсутствия." : "Сотрудники не найдены."}</div>`}
+            }).join("") || `<div class="empty-state">${isReservePicker ? "Активные водители не найдены." : "Сотрудники не найдены."}</div>`}
           </div>
         </div>
       </section>
