@@ -1,6 +1,8 @@
 import http from "node:http";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -12,6 +14,30 @@ const port = Number(process.env.PORT || 5173);
 const host = process.env.HOST || "0.0.0.0";
 const databaseUrl = process.env.DATABASE_URL || "";
 const stateId = process.env.APP_STATE_ID || "main";
+const authStoreFile = path.resolve(process.env.AUTH_STORE_FILE || path.join(__dirname, ".data", "auth-store.json"));
+const scrypt = promisify(scryptCallback);
+const sessionCookieName = "caraul_session";
+const sessionLifetimeMs = 7 * 24 * 60 * 60 * 1000;
+const sessions = new Map();
+const loginAttempts = new Map();
+const permissionCatalog = {
+  "roster.view": "Раскладка: просмотр",
+  "roster.edit": "Раскладка: изменение",
+  "stats.view": "Статистика: просмотр",
+  "employees.view": "Сотрудники: просмотр",
+  "employees.edit": "Сотрудники: изменение",
+  "work.view": "Работа: просмотр",
+  "work.edit": "Работа: изменение",
+  "members.manage": "Участники: управление",
+  "roles.manage": "Роли: управление",
+  "guard.manage": "Караул: настройки"
+};
+const allPermissions = Object.keys(permissionCatalog);
+let authStore = emptyAuthStore();
+
+function emptyAuthStore() {
+  return { version: 1, users: [], guards: [], roles: [], memberships: [], invites: [], states: {} };
+}
 
 function readSecret(filePath) {
   if (!filePath) return "";
@@ -97,7 +123,7 @@ async function handleHealth(req, res) {
   }
 
   if (!pool) {
-    sendJson(res, 200, { status: "ok", database: "disabled" });
+    sendJson(res, 200, { status: "ok", database: "disabled", storage: "file" });
     return;
   }
 
@@ -111,7 +137,10 @@ async function handleHealth(req, res) {
 }
 
 async function ensureDatabase() {
-  if (!pool) return;
+  if (!pool) {
+    await loadAuthStore();
+    return;
+  }
   await pool.query(`
     create table if not exists app_state (
       id text primary key,
@@ -119,23 +148,78 @@ async function ensureDatabase() {
       updated_at timestamptz not null default now()
     )
   `);
+  await pool.query(`
+    create table if not exists app_auth (
+      id text primary key,
+      data jsonb not null,
+      updated_at timestamptz not null default now()
+    )
+  `);
+  await loadAuthStore();
 }
 
-async function readAppState() {
-  if (!pool) return null;
-  const result = await pool.query("select data from app_state where id = $1", [stateId]);
+async function readAppState(guardId) {
+  if (!pool) return authStore.states?.[guardId] || null;
+  const result = await pool.query("select data from app_state where id = $1", [guardId]);
   return result.rows[0]?.data || null;
 }
 
-async function saveAppState(data) {
-  if (!pool) return null;
+async function saveAppState(guardId, data) {
+  if (!pool) {
+    authStore.states ||= {};
+    authStore.states[guardId] = data;
+    await persistAuthStore();
+    return new Date().toISOString();
+  }
   const result = await pool.query(`
     insert into app_state (id, data, updated_at)
     values ($1, $2::jsonb, now())
     on conflict (id) do update set data = excluded.data, updated_at = now()
     returning updated_at
-  `, [stateId, JSON.stringify(data)]);
+  `, [guardId, JSON.stringify(data)]);
   return result.rows[0]?.updated_at || null;
+}
+
+function normalizeAuthStore(value) {
+  const clean = value && typeof value === "object" ? value : {};
+  return {
+    version: 1,
+    users: Array.isArray(clean.users) ? clean.users : [],
+    guards: Array.isArray(clean.guards) ? clean.guards : [],
+    roles: Array.isArray(clean.roles) ? clean.roles : [],
+    memberships: Array.isArray(clean.memberships) ? clean.memberships : [],
+    invites: Array.isArray(clean.invites) ? clean.invites : [],
+    states: clean.states && typeof clean.states === "object" && !Array.isArray(clean.states) ? clean.states : {}
+  };
+}
+
+async function loadAuthStore() {
+  if (pool) {
+    const result = await pool.query("select data from app_auth where id = 'main'");
+    authStore = normalizeAuthStore(result.rows[0]?.data);
+    return;
+  }
+  try {
+    authStore = normalizeAuthStore(JSON.parse(await readFile(authStoreFile, "utf8")));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    authStore = emptyAuthStore();
+  }
+}
+
+async function persistAuthStore() {
+  if (pool) {
+    await pool.query(`
+      insert into app_auth (id, data, updated_at)
+      values ('main', $1::jsonb, now())
+      on conflict (id) do update set data = excluded.data, updated_at = now()
+    `, [JSON.stringify(authStore)]);
+    return;
+  }
+  await mkdir(path.dirname(authStoreFile), { recursive: true });
+  const temporaryFile = `${authStoreFile}.${process.pid}.tmp`;
+  await writeFile(temporaryFile, JSON.stringify(authStore, null, 2), { mode: 0o600 });
+  await rename(temporaryFile, authStoreFile);
 }
 
 function readBody(req) {
@@ -203,6 +287,183 @@ function compareRosterPeople(a, b) {
   const driverDiff = Number(isDriverPosition(personPosition(a))) - Number(isDriverPosition(personPosition(b)));
   if (driverDiff) return driverDiff;
   return String(a?.lastName || personName(a)).localeCompare(String(b?.lastName || personName(b)), "ru");
+}
+
+function createId(prefix) {
+  return `${prefix}_${randomBytes(12).toString("hex")}`;
+}
+
+function normalizedLogin(value) {
+  return String(value || "").trim().toLocaleLowerCase("ru");
+}
+
+function validLogin(value) {
+  return /^[\p{L}\p{N}._-]{3,40}$/u.test(String(value || ""));
+}
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const result = await scrypt(password, salt, 64);
+  return `scrypt$${salt.toString("hex")}$${Buffer.from(result).toString("hex")}`;
+}
+
+async function verifyPassword(password, encoded) {
+  const [algorithm, saltHex, hashHex] = String(encoded || "").split("$");
+  if (algorithm !== "scrypt" || !saltHex || !hashHex) return false;
+  const expected = Buffer.from(hashHex, "hex");
+  const actual = Buffer.from(await scrypt(password, Buffer.from(saltHex, "hex"), expected.length));
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function safeUser(user) {
+  return user ? { id: user.id, login: user.login, createdAt: user.createdAt } : null;
+}
+
+function rolePermissions(role) {
+  if (role?.system === "owner") return [...allPermissions];
+  return Array.isArray(role?.permissions) ? role.permissions.filter((permission) => Object.hasOwn(permissionCatalog, permission)) : [];
+}
+
+function createGuardForUser(userId, name) {
+  const now = new Date().toISOString();
+  const guard = { id: createId("guard"), name: String(name || "Мой караул").trim().slice(0, 80) || "Мой караул", ownerUserId: userId, createdAt: now };
+  const roles = [
+    { id: createId("role"), guardId: guard.id, name: "Главный администратор", system: "owner", permissions: [...allPermissions], createdAt: now },
+    { id: createId("role"), guardId: guard.id, name: "Администратор", system: "admin", permissions: [...allPermissions], createdAt: now },
+    { id: createId("role"), guardId: guard.id, name: "Редактор", system: "editor", permissions: ["roster.view", "roster.edit", "stats.view", "employees.view", "employees.edit", "work.view", "work.edit"], createdAt: now },
+    { id: createId("role"), guardId: guard.id, name: "Наблюдатель", system: "viewer", permissions: ["roster.view", "stats.view", "employees.view", "work.view"], createdAt: now }
+  ];
+  authStore.guards.push(guard);
+  authStore.roles.push(...roles);
+  authStore.memberships.push({ id: createId("member"), guardId: guard.id, userId, roleId: roles[0].id, createdAt: now });
+  return guard;
+}
+
+function membershipsForUser(userId) {
+  return authStore.memberships.filter((membership) => membership.userId === userId && authStore.guards.some((guard) => guard.id === membership.guardId));
+}
+
+function sessionContext(session) {
+  const user = authStore.users.find((item) => item.id === session?.userId);
+  if (!user) return null;
+  const memberships = membershipsForUser(user.id);
+  const membership = memberships.find((item) => item.guardId === session.guardId) || memberships[0];
+  if (!membership) return { user, guards: [], membership: null, guard: null, role: null, permissions: [] };
+  session.guardId = membership.guardId;
+  const guard = authStore.guards.find((item) => item.id === membership.guardId);
+  const role = authStore.roles.find((item) => item.id === membership.roleId && item.guardId === membership.guardId);
+  return {
+    user,
+    membership,
+    guard,
+    role,
+    permissions: rolePermissions(role),
+    guards: memberships.map((item) => {
+      const itemGuard = authStore.guards.find((guardEntry) => guardEntry.id === item.guardId);
+      const itemRole = authStore.roles.find((roleEntry) => roleEntry.id === item.roleId);
+      return itemGuard ? { id: itemGuard.id, name: itemGuard.name, roleName: itemRole?.name || "Без роли" } : null;
+    }).filter(Boolean)
+  };
+}
+
+function parseCookies(req) {
+  return Object.fromEntries(String(req.headers.cookie || "").split(";").map((part) => part.trim()).filter(Boolean).map((part) => {
+    const index = part.indexOf("=");
+    return index < 0 ? [part, ""] : [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+  }));
+}
+
+function getSession(req) {
+  const token = parseCookies(req)[sessionCookieName];
+  const session = token ? sessions.get(token) : null;
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  session.expiresAt = Date.now() + sessionLifetimeMs;
+  return { token, session, context: sessionContext(session) };
+}
+
+function setSessionCookie(req, res, token, maxAge = Math.floor(sessionLifetimeMs / 1000)) {
+  const secure = req.headers["x-forwarded-proto"] === "https";
+  res.setHeader("set-cookie", `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`);
+}
+
+function startSession(req, res, userId, guardId) {
+  const token = randomBytes(32).toString("base64url");
+  sessions.set(token, { userId, guardId, expiresAt: Date.now() + sessionLifetimeMs });
+  setSessionCookie(req, res, token);
+  return sessions.get(token);
+}
+
+function endSession(req, res) {
+  const active = getSession(req);
+  if (active) sessions.delete(active.token);
+  setSessionCookie(req, res, "", 0);
+}
+
+function hasPermission(context, permission) {
+  return Boolean(context?.permissions.includes(permission));
+}
+
+function sessionPayload(context) {
+  return {
+    user: safeUser(context.user),
+    guard: context.guard ? { id: context.guard.id, name: context.guard.name, ownerUserId: context.guard.ownerUserId } : null,
+    role: context.role ? { id: context.role.id, name: context.role.name, system: context.role.system || "" } : null,
+    permissions: context.permissions,
+    guards: context.guards,
+    canImportLegacy: Boolean(context.guard && authStore.guards.length === 1 && context.guard.ownerUserId === context.user.id),
+    permissionCatalog
+  };
+}
+
+function requireAccountSession(req, res) {
+  const active = getSession(req);
+  if (!active?.context?.user) {
+    sendJson(res, 401, { error: "Требуется вход в систему" });
+    return null;
+  }
+  return active;
+}
+
+function requireSession(req, res, permission = "") {
+  const active = requireAccountSession(req, res);
+  if (!active) return null;
+  if (!active.context.guard) {
+    sendJson(res, 409, { error: "Сначала создайте караул или примите приглашение" });
+    return null;
+  }
+  if (permission && !hasPermission(active.context, permission)) {
+    sendJson(res, 403, { error: "Недостаточно прав" });
+    return null;
+  }
+  return active;
+}
+
+function cleanPermissions(value) {
+  const permissions = new Set((Array.isArray(value) ? value : []).filter((permission) => Object.hasOwn(permissionCatalog, permission)));
+  if (permissions.has("roster.edit")) permissions.add("roster.view");
+  if (permissions.has("employees.edit")) permissions.add("employees.view");
+  if (permissions.has("work.edit")) permissions.add("work.view");
+  return [...permissions];
+}
+
+function inviteTokenHash(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function loginAttemptKey(req, login) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return `${forwarded || req.socket.remoteAddress || "local"}:${normalizedLogin(login)}`;
+}
+
+function loginAttempt(req, login) {
+  const key = loginAttemptKey(req, login);
+  const current = loginAttempts.get(key);
+  if (!current || current.resetAt <= Date.now()) return { key, count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
+  return { key, ...current };
 }
 
 function hasRtpProfession(profession) {
@@ -553,23 +814,319 @@ function renderDutyRosterVkCard(data) {
 </html>`;
 }
 
+function accessPayload(context) {
+  const canSeeRoles = hasPermission(context, "roles.manage") || hasPermission(context, "members.manage");
+  const canSeeMembers = hasPermission(context, "members.manage");
+  const allRoles = authStore.roles.filter((role) => role.guardId === context.guard.id).map((role) => ({
+    id: role.id,
+    name: role.name,
+    system: role.system || "",
+    permissions: rolePermissions(role)
+  }));
+  const members = canSeeMembers ? authStore.memberships.filter((membership) => membership.guardId === context.guard.id).map((membership) => {
+    const user = authStore.users.find((item) => item.id === membership.userId);
+    const role = allRoles.find((item) => item.id === membership.roleId);
+    return user ? { id: membership.id, user: safeUser(user), roleId: membership.roleId, roleName: role?.name || "Без роли", isOwner: user.id === context.guard.ownerUserId } : null;
+  }).filter(Boolean).sort((a, b) => a.user.login.localeCompare(b.user.login, "ru")) : [];
+  const now = Date.now();
+  const invites = canSeeMembers ? authStore.invites.filter((invite) => invite.guardId === context.guard.id && !invite.usedAt && Date.parse(invite.expiresAt) > now).map((invite) => ({
+    id: invite.id,
+    roleId: invite.roleId,
+    roleName: allRoles.find((role) => role.id === invite.roleId)?.name || "Без роли",
+    createdAt: invite.createdAt,
+    expiresAt: invite.expiresAt
+  })) : [];
+  return { ...sessionPayload(context), roles: canSeeRoles ? allRoles : [], members, invites };
+}
+
+async function handleAccountApi(req, res, url, payload) {
+  if (url.pathname === "/api/auth/register" && req.method === "POST") {
+    const login = String(payload.login || "").trim();
+    const loginKey = normalizedLogin(login);
+    const password = String(payload.password || "");
+    if (!validLogin(login)) return sendJson(res, 400, { error: "Логин должен содержать от 3 до 40 букв, цифр или символов . _ -" }), true;
+    if (password.length < 6 || password.length > 128) return sendJson(res, 400, { error: "Пароль должен содержать от 6 до 128 символов" }), true;
+    if (password !== String(payload.passwordRepeat || "")) return sendJson(res, 400, { error: "Пароли не совпадают" }), true;
+    if (authStore.users.some((user) => user.loginKey === loginKey)) return sendJson(res, 409, { error: "Этот логин уже занят" }), true;
+    const now = new Date().toISOString();
+    const user = { id: createId("user"), login, loginKey, passwordHash: await hashPassword(password), createdAt: now };
+    authStore.users.push(user);
+    await persistAuthStore();
+    const session = startSession(req, res, user.id, "");
+    sendJson(res, 201, sessionPayload(sessionContext(session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/auth/login" && req.method === "POST") {
+    const attempt = loginAttempt(req, payload.login);
+    if (attempt.count >= 10) {
+      res.setHeader("retry-after", String(Math.max(1, Math.ceil((attempt.resetAt - Date.now()) / 1000))));
+      sendJson(res, 429, { error: "Слишком много попыток входа. Попробуйте позже" });
+      return true;
+    }
+    const user = authStore.users.find((item) => item.loginKey === normalizedLogin(payload.login));
+    if (!user || !await verifyPassword(String(payload.password || ""), user.passwordHash)) {
+      loginAttempts.set(attempt.key, { count: attempt.count + 1, resetAt: attempt.resetAt });
+      sendJson(res, 401, { error: "Неверный логин или пароль" });
+      return true;
+    }
+    loginAttempts.delete(attempt.key);
+    const membership = membershipsForUser(user.id)[0];
+    const session = startSession(req, res, user.id, membership?.guardId || "");
+    sendJson(res, 200, sessionPayload(sessionContext(session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/auth/logout" && req.method === "POST") {
+    endSession(req, res);
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (url.pathname === "/api/auth/session" && req.method === "GET") {
+    const active = getSession(req);
+    if (!active?.context?.user) sendJson(res, 401, { error: "Требуется вход в систему" });
+    else sendJson(res, 200, sessionPayload(active.context));
+    return true;
+  }
+
+  if (url.pathname === "/api/guards" && req.method === "POST") {
+    const active = requireAccountSession(req, res);
+    if (!active) return true;
+    const name = String(payload.name || "").trim();
+    if (!name || name.length > 80) return sendJson(res, 400, { error: "Укажите название караула до 80 символов" }), true;
+    const isFirstGuard = authStore.guards.length === 0;
+    const guard = createGuardForUser(active.context.user.id, name);
+    if (isFirstGuard) {
+      const legacyState = await readAppState(stateId);
+      if (legacyState) await saveAppState(guard.id, legacyState);
+    }
+    active.session.guardId = guard.id;
+    await persistAuthStore();
+    sendJson(res, 201, sessionPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/guards/select" && req.method === "POST") {
+    const active = requireAccountSession(req, res);
+    if (!active) return true;
+    const membership = membershipsForUser(active.context.user.id).find((item) => item.guardId === payload.guardId);
+    if (!membership) return sendJson(res, 404, { error: "Караул не найден" }), true;
+    active.session.guardId = membership.guardId;
+    sendJson(res, 200, sessionPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/guards/current" && req.method === "PUT") {
+    const active = requireSession(req, res, "guard.manage");
+    if (!active) return true;
+    const name = String(payload.name || "").trim();
+    if (!name || name.length > 80) return sendJson(res, 400, { error: "Укажите название караула до 80 символов" }), true;
+    active.context.guard.name = name;
+    await persistAuthStore();
+    sendJson(res, 200, sessionPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/access" && req.method === "GET") {
+    const active = requireSession(req, res);
+    if (!active) return true;
+    sendJson(res, 200, accessPayload(active.context));
+    return true;
+  }
+
+  if (url.pathname === "/api/roles" && req.method === "POST") {
+    const active = requireSession(req, res, "roles.manage");
+    if (!active) return true;
+    const name = String(payload.name || "").trim();
+    if (!name || name.length > 60) return sendJson(res, 400, { error: "Укажите название роли до 60 символов" }), true;
+    if (authStore.roles.some((role) => role.guardId === active.context.guard.id && role.name.toLocaleLowerCase("ru") === name.toLocaleLowerCase("ru"))) return sendJson(res, 409, { error: "Роль с таким названием уже существует" }), true;
+    const role = { id: createId("role"), guardId: active.context.guard.id, name, system: "", permissions: cleanPermissions(payload.permissions), createdAt: new Date().toISOString() };
+    authStore.roles.push(role);
+    await persistAuthStore();
+    sendJson(res, 201, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  const roleMatch = url.pathname.match(/^\/api\/roles\/([^/]+)$/);
+  if (roleMatch && req.method === "PUT") {
+    const active = requireSession(req, res, "roles.manage");
+    if (!active) return true;
+    const role = authStore.roles.find((item) => item.id === roleMatch[1] && item.guardId === active.context.guard.id);
+    if (!role) return sendJson(res, 404, { error: "Роль не найдена" }), true;
+    if (role.system === "owner") return sendJson(res, 400, { error: "Права главного администратора нельзя изменить" }), true;
+    const name = String(payload.name || "").trim();
+    if (!name || name.length > 60) return sendJson(res, 400, { error: "Укажите название роли до 60 символов" }), true;
+    if (authStore.roles.some((item) => item.guardId === active.context.guard.id && item.id !== role.id && item.name.toLocaleLowerCase("ru") === name.toLocaleLowerCase("ru"))) return sendJson(res, 409, { error: "Роль с таким названием уже существует" }), true;
+    role.name = name;
+    role.permissions = cleanPermissions(payload.permissions);
+    await persistAuthStore();
+    sendJson(res, 200, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (roleMatch && req.method === "DELETE") {
+    const active = requireSession(req, res, "roles.manage");
+    if (!active) return true;
+    const role = authStore.roles.find((item) => item.id === roleMatch[1] && item.guardId === active.context.guard.id);
+    if (!role) return sendJson(res, 404, { error: "Роль не найдена" }), true;
+    if (role.system) return sendJson(res, 400, { error: "Системную роль удалить нельзя" }), true;
+    if (authStore.memberships.some((item) => item.roleId === role.id)) return sendJson(res, 409, { error: "Сначала назначьте участникам другую роль" }), true;
+    authStore.roles = authStore.roles.filter((item) => item.id !== role.id);
+    await persistAuthStore();
+    sendJson(res, 200, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/members" && req.method === "POST") {
+    const active = requireSession(req, res, "members.manage");
+    if (!active) return true;
+    const user = authStore.users.find((item) => item.loginKey === normalizedLogin(payload.login));
+    const role = authStore.roles.find((item) => item.id === payload.roleId && item.guardId === active.context.guard.id);
+    if (!user) return sendJson(res, 404, { error: "Пользователь с таким логином не найден" }), true;
+    if (!role || role.system === "owner") return sendJson(res, 400, { error: "Выберите доступную роль" }), true;
+    if (authStore.memberships.some((item) => item.guardId === active.context.guard.id && item.userId === user.id)) return sendJson(res, 409, { error: "Пользователь уже состоит в этом карауле" }), true;
+    authStore.memberships.push({ id: createId("member"), guardId: active.context.guard.id, userId: user.id, roleId: role.id, createdAt: new Date().toISOString() });
+    await persistAuthStore();
+    sendJson(res, 201, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  const memberMatch = url.pathname.match(/^\/api\/members\/([^/]+)$/);
+  if (memberMatch && (req.method === "PUT" || req.method === "DELETE")) {
+    const active = requireSession(req, res, "members.manage");
+    if (!active) return true;
+    const membership = authStore.memberships.find((item) => item.id === memberMatch[1] && item.guardId === active.context.guard.id);
+    if (!membership) return sendJson(res, 404, { error: "Участник не найден" }), true;
+    if (membership.userId === active.context.guard.ownerUserId) return sendJson(res, 400, { error: "Главного администратора нельзя удалить или переназначить" }), true;
+    if (req.method === "DELETE") authStore.memberships = authStore.memberships.filter((item) => item.id !== membership.id);
+    else {
+      const role = authStore.roles.find((item) => item.id === payload.roleId && item.guardId === active.context.guard.id && item.system !== "owner");
+      if (!role) return sendJson(res, 400, { error: "Выберите доступную роль" }), true;
+      membership.roleId = role.id;
+    }
+    await persistAuthStore();
+    sendJson(res, 200, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  if (url.pathname === "/api/invites" && req.method === "POST") {
+    const active = requireSession(req, res, "members.manage");
+    if (!active) return true;
+    const role = authStore.roles.find((item) => item.id === payload.roleId && item.guardId === active.context.guard.id && item.system !== "owner");
+    if (!role) return sendJson(res, 400, { error: "Выберите доступную роль" }), true;
+    const token = randomBytes(24).toString("base64url");
+    const invite = { id: createId("invite"), guardId: active.context.guard.id, roleId: role.id, tokenHash: inviteTokenHash(token), createdBy: active.context.user.id, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), usedAt: "" };
+    authStore.invites.push(invite);
+    await persistAuthStore();
+    const protocol = req.headers["x-forwarded-proto"] || "http";
+    sendJson(res, 201, { ...accessPayload(sessionContext(active.session)), inviteUrl: `${protocol}://${req.headers.host}/?invite=${encodeURIComponent(token)}` });
+    return true;
+  }
+
+  if (url.pathname === "/api/invites/accept" && req.method === "POST") {
+    const active = requireAccountSession(req, res);
+    if (!active) return true;
+    const invite = authStore.invites.find((item) => !item.usedAt && item.tokenHash === inviteTokenHash(String(payload.token || "")) && Date.parse(item.expiresAt) > Date.now());
+    if (!invite) return sendJson(res, 404, { error: "Приглашение недействительно или истекло" }), true;
+    let membership = authStore.memberships.find((item) => item.guardId === invite.guardId && item.userId === active.context.user.id);
+    if (!membership) {
+      membership = { id: createId("member"), guardId: invite.guardId, userId: active.context.user.id, roleId: invite.roleId, createdAt: new Date().toISOString() };
+      authStore.memberships.push(membership);
+    }
+    invite.usedAt = new Date().toISOString();
+    invite.usedBy = active.context.user.id;
+    active.session.guardId = invite.guardId;
+    await persistAuthStore();
+    sendJson(res, 200, sessionPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  const inviteMatch = url.pathname.match(/^\/api\/invites\/([^/]+)$/);
+  if (inviteMatch && req.method === "DELETE") {
+    const active = requireSession(req, res, "members.manage");
+    if (!active) return true;
+    const invite = authStore.invites.find((item) => item.id === inviteMatch[1] && item.guardId === active.context.guard.id && !item.usedAt);
+    if (!invite) return sendJson(res, 404, { error: "Приглашение не найдено" }), true;
+    authStore.invites = authStore.invites.filter((item) => item.id !== invite.id);
+    await persistAuthStore();
+    sendJson(res, 200, accessPayload(sessionContext(active.session)));
+    return true;
+  }
+
+  return false;
+}
+
+function projectAppState(value, context) {
+  if (!value || typeof value !== "object") return null;
+  const projected = {
+    appTitle: value.appTitle || context.guard.name || "Караул",
+    employees: [],
+    equipment: [],
+    equipmentGroups: {},
+    absences: [],
+    templateBlocks: [],
+    rosters: {}
+  };
+  if (["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.employees = value.employees || [];
+  if (["roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.absences = value.absences || [];
+  if (hasPermission(context, "roster.view")) {
+    projected.templateBlocks = value.templateBlocks || [];
+    projected.rosters = value.rosters || {};
+  }
+  if (hasPermission(context, "work.view")) {
+    projected.equipment = value.equipment || [];
+    projected.equipmentGroups = value.equipmentGroups || {};
+  }
+  return projected;
+}
+
+function mergeAuthorizedState(previousValue, submittedValue, context) {
+  const previous = previousValue && typeof previousValue === "object" ? previousValue : {};
+  const submitted = submittedValue && typeof submittedValue === "object" ? submittedValue : {};
+  const visiblePrevious = projectAppState(previous, context) || {};
+  const merged = { ...previous };
+  const sections = [
+    { keys: ["appTitle"], edit: "guard.manage", view: true },
+    { keys: ["employees"], edit: "employees.edit", view: ["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission)) },
+    { keys: ["equipment", "equipmentGroups"], edit: "work.edit", view: hasPermission(context, "work.view") },
+    { keys: ["absences"], edit: "roster.edit", view: hasPermission(context, "roster.view") || hasPermission(context, "stats.view") },
+    { keys: ["templateBlocks", "rosters"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
+  ];
+  for (const section of sections) {
+    for (const key of section.keys) {
+      if (hasPermission(context, section.edit)) {
+        if (Object.hasOwn(submitted, key)) merged[key] = submitted[key];
+      } else if (section.view && JSON.stringify(submitted[key]) !== JSON.stringify(visiblePrevious[key])) {
+        return { error: `Недостаточно прав: ${permissionCatalog[section.edit]}` };
+      }
+    }
+  }
+  return { state: merged };
+}
+
 async function handleApi(req, res) {
   try {
     const raw = await readBody(req);
     const payload = raw ? JSON.parse(raw) : {};
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-    if (req.url === "/api/state") {
+    if (await handleAccountApi(req, res, url, payload)) return;
+
+    if (url.pathname === "/api/state") {
+      const active = requireSession(req, res);
+      if (!active) return;
       if (req.method === "GET") {
-        sendJson(res, 200, { state: await readAppState(), database: Boolean(pool) });
+        sendJson(res, 200, { state: projectAppState(await readAppState(active.context.guard.id), active.context), database: Boolean(pool) });
         return;
       }
 
       if (req.method === "PUT" || req.method === "POST") {
-        if (!pool) {
-          sendJson(res, 503, { error: "DATABASE_URL is not configured" });
-          return;
-        }
-        const savedAt = await saveAppState(payload.state || payload);
+        const nextState = payload.state || payload;
+        const previousState = await readAppState(active.context.guard.id);
+        const merged = mergeAuthorizedState(previousState, nextState, active.context);
+        if (merged.error) return sendJson(res, 403, { error: merged.error });
+        const savedAt = await saveAppState(active.context.guard.id, merged.state);
         sendJson(res, 200, { ok: true, savedAt });
         return;
       }
@@ -578,12 +1135,14 @@ async function handleApi(req, res) {
       return;
     }
 
-    if (req.url === "/api/roster-card/html") {
+    if (url.pathname === "/api/roster-card/html") {
+      if (!requireSession(req, res, "roster.view")) return;
       sendJson(res, 200, { html: renderDutyRosterVkCard(payload) });
       return;
     }
 
-    if (req.url === "/api/roster-card/png") {
+    if (url.pathname === "/api/roster-card/png") {
+      if (!requireSession(req, res, "roster.view")) return;
       try {
         const { chromium } = await import("playwright");
         const browser = await chromium.launch({ headless: true });
@@ -646,7 +1205,7 @@ ensureDatabase()
     server.listen(port, host, () => {
       console.log(`Караул доступен: http://localhost:${port}`);
       console.log(`Для телефона в той же Wi-Fi сети откройте: http://<ip-этого-Mac>:${port}`);
-      console.log(pool ? "Postgres подключен: состояние сохраняется в БД" : "DATABASE_URL не задан: серверное сохранение отключено");
+      console.log(pool ? "Postgres подключен: аккаунты и караулы сохраняются в БД" : `Postgres не задан: аккаунты и караулы сохраняются в ${authStoreFile}`);
     });
   })
   .catch((error) => {

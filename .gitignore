@@ -6,3 +6,5 @@ output/
 secrets/
 .deploy-*/
 release/
+.data/
+.tmp-*

@@ -1,13 +1,15 @@
 const STORAGE_KEY = "caraul-state-v2";
-const AUTH_KEY = "caraul-auth-v1";
+const LEGACY_MIGRATION_KEY = "caraul-state-server-migrated-v1";
 const UI_STORAGE_KEY = "caraul-ui-v1";
 
 const views = [
   ["roster", "▦", "Раскладка"],
   ["stats", "▤", "Статистика"],
   ["employees", "☷", "Сотрудники"],
-  ["work", "⚒", "Работа"]
+  ["work", "⚒", "Работа"],
+  ["access", "⚙", "Доступ"]
 ];
+const viewPermissions = { roster: "roster.view", stats: "stats.view", employees: "employees.view", work: "work.view" };
 
 const equipmentConditions = {
   READY: { label: "Исправно", color: "green" },
@@ -118,9 +120,9 @@ const shortMonthNames = [
 ];
 
 const app = document.querySelector("#app");
-let state = loadState();
+let auth = { ready: false, mode: "login", session: null, access: null, error: "", busy: false, inviteUrl: "" };
+let state = blankState();
 let equipmentGroups = state.equipmentGroups;
-let authenticated = localStorage.getItem(AUTH_KEY) === "ok";
 let remoteStateLoaded = false;
 let persistTimer = 0;
 let ui = {
@@ -143,6 +145,10 @@ let ui = {
   equipmentCondition: "",
   equipmentSort: "asc",
   equipmentGroup: "PTV",
+  equipmentLocation: "",
+  collapsedEquipmentIds: [],
+  accessExpandedMemberId: "",
+  accessExpandedRoleId: "",
   sending: false,
   renderedPng: "",
   pngStatus: ""
@@ -164,6 +170,10 @@ function restoreUiState() {
     if (Object.hasOwn(equipmentGroups, saved.equipmentGroup)) ui.equipmentGroup = saved.equipmentGroup;
     if (saved.equipmentCondition === "" || Object.hasOwn(equipmentConditions, saved.equipmentCondition)) ui.equipmentCondition = saved.equipmentCondition;
     if (["asc", "desc"].includes(saved.equipmentSort)) ui.equipmentSort = saved.equipmentSort;
+    if (typeof saved.equipmentLocation === "string") ui.equipmentLocation = saved.equipmentLocation;
+    if (Array.isArray(saved.collapsedEquipmentIds)) {
+      ui.collapsedEquipmentIds = saved.collapsedEquipmentIds.filter((id) => typeof id === "string");
+    }
     const stats = saved.stats;
     if (stats && typeof stats === "object") {
       for (const key of ["from", "to"]) if (validDate(stats[key])) ui.stats[key] = stats[key];
@@ -194,6 +204,8 @@ function saveUiState() {
       equipmentCondition: ui.equipmentCondition,
       equipmentSort: ui.equipmentSort,
       equipmentGroup: ui.equipmentGroup,
+      equipmentLocation: ui.equipmentLocation,
+      collapsedEquipmentIds: ui.collapsedEquipmentIds,
       stats: ui.stats,
       scroll: savedUiScroll
     }));
@@ -206,13 +218,7 @@ function makeShortName(lastName, firstName, middleName) {
   return `${lastName} ${firstName?.[0] || ""}.${middleName?.[0] || ""}.`;
 }
 
-function loadState() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-    if (Array.isArray(saved?.employees)) return normalizeState(saved);
-  } catch {
-    // Keep the default state if localStorage was manually edited.
-  }
+function blankState() {
   return {
     appTitle: "Караул",
     employees: [],
@@ -222,6 +228,17 @@ function loadState() {
     templateBlocks: [],
     rosters: {}
   };
+}
+
+function loadState() {
+  try {
+    const mayImportLegacy = auth.session?.canImportLegacy && localStorage.getItem(LEGACY_MIGRATION_KEY) !== "done";
+    const saved = JSON.parse(mayImportLegacy ? localStorage.getItem(STORAGE_KEY) || "null" : "null");
+    if (Array.isArray(saved?.employees)) return normalizeState(saved);
+  } catch {
+    // Keep the default state if localStorage was manually edited.
+  }
+  return blankState();
 }
 
 function normalizeState(nextState) {
@@ -278,7 +295,7 @@ function normalizeRoster(roster) {
 }
 
 function persist() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  if (!auth.session?.guard) return;
   if (!remoteStateLoaded) return;
   window.clearTimeout(persistTimer);
   persistTimer = window.setTimeout(saveStateToServer, 450);
@@ -287,6 +304,13 @@ function persist() {
 async function loadStateFromServer() {
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
+    if (response.status === 401) {
+      auth.session = null;
+      auth.access = null;
+      remoteStateLoaded = false;
+      render();
+      return;
+    }
     if (!response.ok) throw new Error("state api unavailable");
     const result = await response.json();
     remoteStateLoaded = true;
@@ -294,24 +318,38 @@ async function loadStateFromServer() {
       state = normalizeState(result.state);
       equipmentGroups = state.equipmentGroups;
       if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = "PTV";
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      if (auth.session?.canImportLegacy) {
+        localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
+        localStorage.removeItem(STORAGE_KEY);
+      }
       normalizeStatsDates();
       render();
     } else {
       persist();
+      render();
     }
   } catch {
     remoteStateLoaded = false;
+    render();
   }
 }
 
-async function saveStateToServer() {
+async function saveStateToServer(keepalive = false) {
   try {
-    await fetch("/api/state", {
+    const response = await fetch("/api/state", {
       method: "PUT",
       headers: { "content-type": "application/json" },
+      keepalive,
       body: JSON.stringify({ state })
     });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 401) await initializeAuth();
+      else showToast(result.error || "Не удалось сохранить изменения");
+    } else if (auth.session?.canImportLegacy) {
+      localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
+      localStorage.removeItem(STORAGE_KEY);
+    }
   } catch {
     // Local storage remains the offline fallback if the database is unavailable.
   }
@@ -325,10 +363,19 @@ function render() {
       ? savedUiScroll
       : { top: 0, left: 0 };
   document.title = state.appTitle;
-  if (!authenticated) {
-    renderLogin();
+  if (!auth.ready) {
+    app.innerHTML = `<main class="login-shell"><div class="login-panel"><div class="login-mark">К</div><p class="muted">Загрузка…</p></div></main>`;
     return;
   }
+  if (!auth.session) {
+    renderAuth();
+    return;
+  }
+  if (!auth.session.guard) {
+    renderGuardChoice();
+    return;
+  }
+  ensureAllowedView();
 
   app.innerHTML = `
     <div class="app">
@@ -336,8 +383,9 @@ function render() {
         <div class="brand">
           <div class="brand-title">
             <strong>${escapeHtml(state.appTitle)}</strong>
-            <button class="brand-edit" data-edit-app-title type="button" aria-label="Изменить название">✎</button>
+            ${can("guard.manage") ? `<button class="brand-edit" data-edit-app-title type="button" aria-label="Изменить название">✎</button>` : ""}
           </div>
+          <span class="brand-guard">${escapeHtml(auth.session.guard.name)}</span>
         </div>
         <nav class="desktop-nav" aria-label="Разделы">${renderNavItems()}</nav>
       </header>
@@ -356,39 +404,203 @@ function render() {
   saveUiState();
 }
 
-function renderLogin() {
-  document.title = state.appTitle;
-  const mark = Array.from(state.appTitle.trim())[0] || "К";
+function renderAuth() {
+  document.title = "Караул — вход";
+  const registering = auth.mode === "register";
   app.innerHTML = `
     <main class="login-shell">
-      <form class="login-panel" data-login-form>
-        <div class="login-mark">${escapeHtml(mark.toUpperCase())}</div>
-        <h1>${escapeHtml(state.appTitle)}</h1>
-        <p class="muted">Административный вход для ежедневной раскладки.</p>
+      <form class="login-panel" data-auth-form>
+        <div class="login-mark">К</div>
+        <h1>${registering ? "Регистрация" : "Вход"}</h1>
+        <p class="muted">${registering ? "Создайте аккаунт — подтверждение не требуется." : "Войдите по логину и паролю."}</p>
         <div class="field-group">
-          <label for="pin">PIN</label>
-          <input id="pin" class="field" name="pin" inputmode="numeric" autocomplete="current-password" placeholder="1234" />
+          <label for="login">Логин</label>
+          <input id="login" class="field" name="login" required minlength="3" maxlength="40" autocomplete="username" />
         </div>
-        <button class="btn" type="submit" style="width:100%">Войти</button>
-        ${ui.toast ? `<p class="small" style="color:var(--danger);margin:12px 0 0">${escapeHtml(ui.toast)}</p>` : ""}
+        <div class="field-group"><label for="password">Пароль</label><input id="password" class="field" name="password" type="password" required minlength="6" maxlength="128" autocomplete="${registering ? "new-password" : "current-password"}" /></div>
+        ${registering ? `<div class="field-group"><label for="password-repeat">Повторите пароль</label><input id="password-repeat" class="field" name="passwordRepeat" type="password" required minlength="6" maxlength="128" autocomplete="new-password" /></div>` : ""}
+        <button class="btn" type="submit" style="width:100%" ${auth.busy ? "disabled" : ""}>${auth.busy ? "Подождите…" : registering ? "Зарегистрироваться" : "Войти"}</button>
+        <button class="auth-switch" data-auth-mode="${registering ? "login" : "register"}" type="button">${registering ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Зарегистрироваться"}</button>
+        ${auth.error ? `<p class="form-error small" style="margin:12px 0 0">${escapeHtml(auth.error)}</p>` : ""}
       </form>
     </main>
   `;
-  document.querySelector("[data-login-form]").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const pin = new FormData(event.currentTarget).get("pin");
-    if (String(pin || "").trim() !== "1234") {
-      showToast("Неверный PIN. Для демо используйте 1234.");
-      return;
-    }
-    authenticated = true;
-    localStorage.setItem(AUTH_KEY, "ok");
+  document.querySelector("[data-auth-mode]").addEventListener("click", (event) => {
+    auth.mode = event.currentTarget.dataset.authMode;
+    auth.error = "";
     render();
+  });
+  document.querySelector("[data-auth-form]").addEventListener("submit", submitAuthForm);
+}
+
+function renderGuardChoice() {
+  document.title = "Караул — выбор караула";
+  app.innerHTML = `
+    <main class="login-shell">
+      <div class="login-panel guard-choice-panel">
+        <div class="login-mark">К</div>
+        <h1>Выберите караул</h1>
+        <p class="muted">Вы вошли как <strong>${escapeHtml(auth.session.user.login)}</strong>. Создайте новый караул или откройте полученную ссылку-приглашение.</p>
+        <form data-create-guard>
+          <div class="field-group"><label for="first-guard-name">Название караула</label><input id="first-guard-name" class="field" name="name" required maxlength="80" placeholder="Например, 1-й караул" autofocus /></div>
+          <button class="btn" type="submit" style="width:100%">Создать караул</button>
+        </form>
+        ${auth.error ? `<p class="form-error small" style="margin:12px 0 0">${escapeHtml(auth.error)}</p>` : ""}
+        <button class="auth-switch" data-logout type="button">Выйти из аккаунта</button>
+      </div>
+    </main>
+  `;
+  bindGuardChoiceEvents();
+}
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: options.body ? { "content-type": "application/json", ...(options.headers || {}) } : options.headers
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "Ошибка запроса");
+  return result;
+}
+
+function can(permission) {
+  return Boolean(auth.session?.permissions?.includes(permission));
+}
+
+function availableViews() {
+  return views.filter(([view]) => view === "access" || can(viewPermissions[view]));
+}
+
+function ensureAllowedView() {
+  if (!availableViews().some(([view]) => view === ui.view)) ui.view = availableViews()[0]?.[0] || "access";
+}
+
+async function activateSession(session) {
+  auth.session = session;
+  auth.error = "";
+  state = loadState();
+  equipmentGroups = state.equipmentGroups;
+  remoteStateLoaded = false;
+  ensureAllowedView();
+  const invite = new URLSearchParams(location.search).get("invite");
+  if (invite) {
+    try {
+      auth.session = await apiRequest("/api/invites/accept", { method: "POST", body: JSON.stringify({ token: invite }) });
+      history.replaceState({}, "", location.pathname);
+      state = loadState();
+      equipmentGroups = state.equipmentGroups;
+      ensureAllowedView();
+    } catch (error) {
+      auth.error = error.message;
+      ui.toast = error.message;
+    }
+  }
+  if (!auth.session.guard) {
+    ui.view = "access";
+    auth.access = null;
+    remoteStateLoaded = false;
+    state = blankState();
+    equipmentGroups = state.equipmentGroups;
+    render();
+    return;
+  }
+  await loadStateFromServer();
+  if (ui.view === "access") await loadAccessData();
+}
+
+async function initializeAuth() {
+  auth.ready = false;
+  render();
+  try {
+    const session = await apiRequest("/api/auth/session", { cache: "no-store" });
+    auth.ready = true;
+    await activateSession(session);
+  } catch {
+    auth.ready = true;
+    auth.session = null;
+    auth.access = null;
+    remoteStateLoaded = false;
+    render();
+  }
+}
+
+async function submitAuthForm(event) {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.currentTarget));
+  auth.busy = true;
+  auth.error = "";
+  render();
+  try {
+    const session = await apiRequest(`/api/auth/${auth.mode}`, { method: "POST", body: JSON.stringify(values) });
+    auth.busy = false;
+    await activateSession(session);
+  } catch (error) {
+    auth.busy = false;
+    auth.error = error.message;
+    render();
+  }
+}
+
+async function logout() {
+  try {
+    await apiRequest("/api/auth/logout", { method: "POST", body: "{}" });
+  } catch {
+    // Clear the local interface even if the session already expired.
+  }
+  auth.session = null;
+  auth.access = null;
+  auth.mode = "login";
+  state = blankState();
+  equipmentGroups = state.equipmentGroups;
+  render();
+}
+
+async function selectGuard(guardId) {
+  try {
+    const session = await apiRequest("/api/guards/select", { method: "POST", body: JSON.stringify({ guardId }) });
+    auth.access = null;
+    auth.inviteUrl = "";
+    await activateSession(session);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function createGuard(name) {
+  const session = await apiRequest("/api/guards", { method: "POST", body: JSON.stringify({ name }) });
+  auth.access = null;
+  auth.inviteUrl = "";
+  await activateSession(session);
+  ui.view = "access";
+  await loadAccessData();
+}
+
+function bindGuardChoiceEvents() {
+  document.querySelector("[data-logout]")?.addEventListener("click", logout);
+  document.querySelector("[data-create-guard]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    try {
+      await createGuard(name);
+    } catch (error) {
+      auth.error = error.message;
+      render();
+    }
   });
 }
 
+async function loadAccessData() {
+  try {
+    auth.access = await apiRequest("/api/access", { cache: "no-store" });
+    auth.session = { ...auth.session, ...auth.access };
+    if (ui.view === "access") render();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 function renderNavItems() {
-  return views.map(([view, icon, label]) => `
+  return availableViews().map(([view, icon, label]) => `
     <button class="nav-item ${ui.view === view ? "active" : ""}" data-view="${view}" type="button">
       <span>${icon}</span>
       <span>${label}</span>
@@ -397,6 +609,7 @@ function renderNavItems() {
 }
 
 function renderCurrentView() {
+  if (ui.view === "access") return renderAccessView();
   if (ui.view === "work") return renderWorkView();
   if (ui.view === "stats") return renderStatsView();
   if (ui.view === "employees") return renderEmployeesView();
@@ -407,7 +620,7 @@ function getRoster(date = ui.selectedDate) {
   if (state.rosters[date]) return normalizeRoster(state.rosters[date]);
   const now = new Date().toISOString();
   const blocks = templateBlocksForDate(date);
-  state.rosters[date] = {
+  const roster = {
     id: `roster-${date}`,
     date,
     blocks,
@@ -418,6 +631,8 @@ function getRoster(date = ui.selectedDate) {
     createdAt: now,
     updatedAt: now
   };
+  if (!can("roster.edit")) return normalizeRoster(roster);
+  state.rosters[date] = roster;
   if (blocks.length) persist();
   return normalizeRoster(state.rosters[date]);
 }
@@ -490,8 +705,18 @@ function applyCurrentTemplateToFutureDates() {
 
 function renderRosterView() {
   const roster = getRoster();
+  const activeEmployeeIds = new Set(state.employees.filter((employee) => employee.isActive).map((employee) => employee.id));
+  const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId).filter((id) => activeEmployeeIds.has(id)));
+  const absentEmployeeIds = new Set(state.employees
+    .filter((employee) => employee.isActive && !assignedEmployeeIds.has(employee.id) && getAbsenceForDate(employee.id, ui.selectedDate))
+    .map((employee) => employee.id));
+  const availableCount = Math.max(0, activeEmployeeIds.size - assignedEmployeeIds.size - absentEmployeeIds.size);
   return `
     <div class="page-title roster-page-actions">
+      <div>
+        <h1>Раскладка</h1>
+        <p class="muted">Состав караула на выбранную дату</p>
+      </div>
       <button class="ghost-btn" data-today type="button">Сегодня</button>
     </div>
 
@@ -501,9 +726,13 @@ function renderRosterView() {
       <button class="icon-btn" data-date-step="1" type="button" aria-label="Следующий день">›</button>
     </div>
 
-    <div class="toolbar">
-      <button class="btn" data-add-block type="button">Добавить блок</button>
+    <div class="roster-summary" aria-label="Сводка по раскладке">
+      <div><strong>${assignedEmployeeIds.size}</strong><span>В строю</span></div>
+      <div><strong>${absentEmployeeIds.size}</strong><span>Отсутствуют</span></div>
+      <div><strong>${availableCount}</strong><span>Свободны</span></div>
     </div>
+
+    ${can("roster.edit") ? `<div class="toolbar"><button class="btn" data-add-block type="button">Добавить блок</button></div>` : ""}
 
     <section class="dashboard-grid">
       ${roster.blocks.map((block) => renderCustomBlockPanel(block)).join("") || renderEmptyBlocksPanel()}
@@ -528,14 +757,13 @@ function renderCustomBlockPanel(block) {
         </div>
         <div class="block-actions">
           <span class="chip yellow">${selected.length}</span>
-          <button class="ghost-btn" data-edit-block="${escapeAttr(block.id)}" type="button">Изменить</button>
-          <button class="danger-btn" data-delete-block="${escapeAttr(block.id)}" type="button">Удалить</button>
+          ${can("roster.edit") ? `<button class="ghost-btn" data-edit-block="${escapeAttr(block.id)}" type="button">Изменить</button><button class="danger-btn" data-delete-block="${escapeAttr(block.id)}" type="button">Удалить</button>` : ""}
         </div>
       </div>
       <div class="panel-body">
         <div class="slot-list">
           ${selected.map((employeeId, index) => renderAssignmentSlot(block.id, index, employeeId)).join("")}
-          ${renderAssignmentSlot(block.id, selected.length, "")}
+          ${can("roster.edit") ? renderAssignmentSlot(block.id, selected.length, "") : ""}
         </div>
       </div>
     </section>
@@ -552,7 +780,7 @@ function renderRosterCommentPanel(roster) {
         </div>
       </div>
       <div class="panel-body">
-        <textarea class="field roster-comment" data-roster-comment maxlength="240" placeholder="Например: сбор в 8:30">${escapeHtml(roster.comment || "")}</textarea>
+        <textarea class="field roster-comment" data-roster-comment maxlength="240" placeholder="Например: сбор в 8:30" ${can("roster.edit") ? "" : "readonly"}>${escapeHtml(roster.comment || "")}</textarea>
       </div>
     </section>
   `;
@@ -571,12 +799,13 @@ function renderEmptyBlocksPanel() {
 function renderAssignmentSlot(blockId, index, employeeId) {
   const employee = findEmployee(employeeId);
   const block = getRoster().blocks.find((item) => item.id === blockId);
+  const tag = can("roster.edit") ? "button" : "div";
   return `
-    <button class="slot ${employee ? "" : "empty"}" data-pick-assignment="${escapeAttr(blockId)}" data-assignment-title="${escapeAttr(block ? blockTitleForDate(block.title, ui.selectedDate) : "Блок")}" data-position="${index}" type="button">
+    <${tag} class="slot ${employee ? "" : "empty"}" ${can("roster.edit") ? `data-pick-assignment="${escapeAttr(blockId)}" data-assignment-title="${escapeAttr(block ? blockTitleForDate(block.title, ui.selectedDate) : "Блок")}" data-position="${index}" type="button"` : ""}>
       <span class="slot-index">${index + 1}</span>
       <span class="slot-name">${employee ? escapeHtml(employee.shortName) : "+ Выбрать сотрудника"}</span>
-      <span class="slot-meta">${employee ? "Изменить" : ""}</span>
-    </button>
+      <span class="slot-meta">${employee && can("roster.edit") ? "Изменить" : ""}</span>
+    </${tag}>
   `;
 }
 
@@ -600,13 +829,13 @@ function renderOthersPanel(roster) {
           ${activeEmployees.map((employee) => {
             const absence = getAbsenceForDate(employee.id, ui.selectedDate);
             return `
-              <button class="other-row" data-status-employee="${employee.id}" type="button">
+              <${can("roster.edit") ? "button" : "div"} class="other-row" ${can("roster.edit") ? `data-status-employee="${employee.id}" type="button"` : ""}>
                 <span>
                   <span class="row-title">${escapeHtml(employee.shortName)}</span>
                   <span class="row-subtitle">${absence ? absencePeriodText(absence) : "Статус не указан"}</span>
                 </span>
                 <span class="chip ${absence ? absenceColors[absence.absenceType] : ""}">${absence ? absenceStatusLabel(absence) : "Указать"}</span>
-              </button>
+              </${can("roster.edit") ? "button" : "div"}>
             `;
           }).join("") || `<div class="empty-state">Все активные сотрудники назначены.</div>`}
         </div>
@@ -700,7 +929,7 @@ function renderEmployeesView() {
   return `
     <div class="page-title">
       <h1>Сотрудники</h1>
-      <button class="btn" data-add-employee type="button">Добавить</button>
+      ${can("employees.edit") ? `<button class="btn" data-add-employee type="button">Добавить</button>` : ""}
     </div>
     <div class="toolbar">
       <input class="search" data-employee-search placeholder="Поиск по фамилии" value="${escapeAttr(ui.employeeSearch)}" />
@@ -715,7 +944,7 @@ function renderEmployeesView() {
               <div class="row-subtitle role-line">${employeeRoleHtml(employee)}</div>
               ${employeeVacationPeriods(employee).map((period) => `<div class="row-subtitle">Отпуск ${formatVacationPeriod(period)}</div>`).join("")}
             </div>
-            <button class="ghost-btn" data-edit-employee="${employee.id}" type="button">Изменить</button>
+            ${can("employees.edit") ? `<button class="ghost-btn" data-edit-employee="${employee.id}" type="button">Изменить</button>` : ""}
           </div>
         `).join("")}
       </div>
@@ -723,19 +952,114 @@ function renderEmployeesView() {
   `;
 }
 
+function permissionCheckboxes(selected = [], disabled = false) {
+  const catalog = auth.session?.permissionCatalog || {};
+  return `<div class="permission-grid">${Object.entries(catalog).map(([key, label]) => `
+    <label class="permission-option"><input type="checkbox" name="permissions" value="${escapeAttr(key)}" ${selected.includes(key) ? "checked" : ""} ${disabled ? "disabled" : ""} /><span>${escapeHtml(label)}</span></label>
+  `).join("")}</div>`;
+}
+
+function roleOptions(roles, selected = "") {
+  return roles.filter((role) => role.system !== "owner").map((role) => `<option value="${escapeAttr(role.id)}" ${role.id === selected ? "selected" : ""}>${escapeHtml(role.name)}</option>`).join("");
+}
+
+function rolePermissionSummary(role) {
+  const total = Object.keys(auth.session?.permissionCatalog || {}).length;
+  return `${role.permissions?.length || 0} из ${total} прав`;
+}
+
+function renderAccessView() {
+  const access = auth.access;
+  if (!access) return `<section class="panel"><div class="empty-state">Загрузка настроек доступа…</div></section>`;
+  const roles = access.roles || [];
+  const editableRoles = roles.filter((role) => role.system !== "owner");
+  return `
+    <div class="page-title"><div><h1>Доступ</h1><p class="muted">Аккаунты, караулы, участники и роли</p></div></div>
+    <section class="panel access-panel">
+      <div class="panel-head"><div><h2>${escapeHtml(auth.session.user.login)}</h2><div class="muted small">${escapeHtml(auth.session.role?.name || "Без роли")}</div></div><button class="ghost-btn" data-logout type="button">Выйти</button></div>
+      <div class="panel-body">
+        <div class="field-group"><label for="guard-select">Текущий караул</label><select id="guard-select" class="field" data-guard-select>${auth.session.guards.map((guard) => `<option value="${escapeAttr(guard.id)}" ${guard.id === auth.session.guard.id ? "selected" : ""}>${escapeHtml(guard.name)} — ${escapeHtml(guard.roleName)}</option>`).join("")}</select></div>
+        <div class="access-toolbar">
+          <button class="btn" data-open-access-modal="guardCreate" type="button">+ Новый караул</button>
+          ${can("guard.manage") ? `<button class="ghost-btn" data-open-access-modal="guardRename" type="button">Переименовать</button>` : ""}
+        </div>
+      </div>
+    </section>
+    ${can("members.manage") ? `
+      <section class="panel access-panel">
+        <div class="panel-head"><div><h2>Участники</h2><div class="muted small">Нажмите на участника для управления</div></div><span class="chip">${access.members.length}</span></div>
+        <div class="panel-body">
+          <div class="access-toolbar access-toolbar-top"><button class="btn" data-open-access-modal="memberAdd" type="button">+ Добавить</button><button class="ghost-btn" data-open-access-modal="inviteCreate" type="button">Создать приглашение</button></div>
+          <div class="access-list">${access.members.map((member) => {
+            const expanded = ui.accessExpandedMemberId === member.id;
+            return `<article class="access-row ${expanded ? "expanded" : ""}">
+              <button class="access-row-trigger" data-toggle-access-member="${escapeAttr(member.id)}" type="button" aria-expanded="${expanded}">
+                <span class="access-avatar">${escapeHtml(Array.from(member.user.login)[0]?.toUpperCase() || "?")}</span>
+                <span class="access-row-main"><strong>${escapeHtml(member.user.login)}</strong><small>${escapeHtml(member.roleName)}</small></span>
+                ${member.isOwner ? `<span class="chip orange">Владелец</span>` : ""}
+                <span class="access-chevron" aria-hidden="true">⌄</span>
+              </button>
+              ${expanded ? `<div class="access-row-detail">${member.isOwner
+                ? `<p class="muted small">Владелец имеет полный доступ к караулу.</p>`
+                : `<div class="field-group"><label for="member-role-${escapeAttr(member.id)}">Роль</label><select id="member-role-${escapeAttr(member.id)}" class="field" data-member-role="${escapeAttr(member.id)}">${roleOptions(editableRoles, member.roleId)}</select></div><button class="danger-btn" data-confirm-remove-member="${escapeAttr(member.id)}" type="button">Удалить из караула</button>`}</div>` : ""}
+            </article>`;
+          }).join("")}</div>
+          ${access.invites.length ? `<div class="active-invites"><strong>Действующие приглашения</strong>${access.invites.map((invite) => `<div class="invite-row"><span><span>${escapeHtml(invite.roleName)}</span><small>до ${escapeHtml(formatShortDate(invite.expiresAt.slice(0, 10)))}</small></span><button class="danger-btn compact-btn" data-confirm-revoke-invite="${escapeAttr(invite.id)}" type="button">Отозвать</button></div>`).join("")}</div>` : ""}
+        </div>
+      </section>
+    ` : ""}
+    ${can("roles.manage") ? `
+      <section class="panel access-panel">
+        <div class="panel-head"><div><h2>Роли</h2><div class="muted small">Раскройте роль, чтобы изменить права</div></div><span class="chip">${roles.length}</span></div>
+        <div class="panel-body">
+          <div class="access-toolbar access-toolbar-top"><button class="btn" data-open-access-modal="roleCreate" type="button">+ Новая роль</button></div>
+          <div class="access-list">${roles.map((role) => {
+            const expanded = ui.accessExpandedRoleId === role.id;
+            return `<article class="access-row role-card ${expanded ? "expanded" : ""}">
+              <button class="access-row-trigger" data-toggle-access-role="${escapeAttr(role.id)}" type="button" aria-expanded="${expanded}">
+                <span class="access-row-main"><strong>${escapeHtml(role.name)}</strong><small>${escapeHtml(rolePermissionSummary(role))}</small></span>
+                ${role.system ? `<span class="chip">Системная</span>` : ""}
+                <span class="access-chevron" aria-hidden="true">⌄</span>
+              </button>
+              ${expanded ? `<form class="access-row-detail role-editor" data-role-form="${escapeAttr(role.id)}">
+                <div class="field-group"><label for="role-name-${escapeAttr(role.id)}">Название роли</label><input id="role-name-${escapeAttr(role.id)}" class="field" name="name" required maxlength="60" value="${escapeAttr(role.name)}" ${role.system === "owner" ? "readonly" : ""} /></div>
+                ${permissionCheckboxes(role.permissions, role.system === "owner")}
+                ${role.system === "owner" ? `<p class="muted small">Права владельца включены всегда.</p>` : `<div class="actions"><button class="btn" type="submit">Сохранить</button>${role.system ? "" : `<button class="danger-btn" data-confirm-delete-role="${escapeAttr(role.id)}" type="button">Удалить роль</button>`}</div>`}
+              </form>` : ""}
+            </article>`;
+          }).join("")}</div>
+        </div>
+      </section>
+    ` : ""}
+  `;
+}
+
 function renderWorkView() {
+  const locations = equipmentStorageLocations();
+  if (ui.equipmentLocation && !locations.includes(ui.equipmentLocation)) ui.equipmentLocation = "";
   const groupCount = state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup).length;
+  const locationCount = ui.equipmentLocation
+    ? state.equipment.filter((item) => equipmentHasLocation(item, ui.equipmentLocation)).length
+    : 0;
   return `
     <div class="page-title work-heading">
       <div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
-      <div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>
+      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>` : ""}
+    </div>
+    <div class="equipment-location-filter">
+      <label for="equipment-location-filter">Выберите машину</label>
+      <select id="equipment-location-filter" class="field" data-equipment-location>
+        <option value="">Все места хранения</option>
+        ${locations.map((location) => `<option value="${escapeAttr(location)}" ${ui.equipmentLocation === location ? "selected" : ""}>${escapeHtml(location)}</option>`).join("")}
+      </select>
+      ${locations.length ? `<span class="muted small">Список составлен из значений поля «Место хранения».</span>` : `<span class="muted small">Заполните «Место хранения» у экземпляров оборудования, и варианты появятся здесь.</span>`}
     </div>
     <div class="equipment-tabs" role="tablist" aria-label="Разделы оборудования">${Object.entries(equipmentGroups).map(([key, label]) => `
-      <button class="equipment-tab ${ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
+      <button class="equipment-tab ${!ui.equipmentLocation && ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${!ui.equipmentLocation && ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
     `).join("")}</div>
     <section id="equipment-group-panel" role="tabpanel" aria-labelledby="equipment-tab-${ui.equipmentGroup}">
     <div class="equipment-summary">
-      <div class="panel"><span class="muted small">Позиций в разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}»</span><strong>${groupCount}</strong></div>
+      <div class="panel"><span class="muted small">${ui.equipmentLocation ? `Позиций в месте хранения «${escapeHtml(ui.equipmentLocation)}»` : `Позиций в разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}»`}</span><strong>${ui.equipmentLocation ? locationCount : groupCount}</strong></div>
     </div>
     <div class="equipment-filters">
       <div class="field-group"><label for="equipment-search">Поиск по базе</label><input id="equipment-search" class="search" data-equipment-search type="search" placeholder="Название, номер или место хранения" value="${escapeAttr(ui.equipmentSearch)}" /></div>
@@ -747,53 +1071,113 @@ function renderWorkView() {
   `;
 }
 
+function isQuantityEquipment(item) {
+  return item?.trackingMode === "quantity";
+}
+
 function equipmentInstances(item) {
+  if (isQuantityEquipment(item)) return [];
   const condition = Object.hasOwn(equipmentConditions, item.condition) ? item.condition : "READY";
   if (Array.isArray(item.instances) && item.instances.length) {
     return item.instances.map((instance) => ({
       ...instance,
-      condition: Object.hasOwn(equipmentConditions, instance.condition) ? instance.condition : condition
+      condition: Object.hasOwn(equipmentConditions, instance.condition) ? instance.condition : condition,
+      comment: typeof instance.comment === "string" ? instance.comment : item.notes || ""
     }));
   }
   const quantity = Number.isSafeInteger(item.quantity) && item.quantity > 0 ? item.quantity : 1;
   return Array.from({ length: quantity }, (_, index) => ({
     inventoryNumber: index === 0 ? item.inventoryNumber || "" : "",
     location: item.location || "",
-    condition
+    condition,
+    comment: item.notes || ""
   }));
+}
+
+function normalizedEquipmentLocation(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function sameEquipmentLocation(left, right) {
+  return normalizedEquipmentLocation(left).localeCompare(normalizedEquipmentLocation(right), "ru", { sensitivity: "base" }) === 0;
+}
+
+function equipmentStorageLocations() {
+  const locations = new Map();
+  state.equipment.forEach((item) => {
+    const itemLocations = isQuantityEquipment(item) ? [item.location] : equipmentInstances(item).map((instance) => instance.location);
+    itemLocations.forEach((value) => {
+      const location = normalizedEquipmentLocation(value);
+      const key = location.toLocaleLowerCase("ru");
+      if (location && !locations.has(key)) locations.set(key, location);
+    });
+  });
+  return [...locations.values()].sort((a, b) => a.localeCompare(b, "ru", { numeric: true, sensitivity: "base" }));
+}
+
+function equipmentHasLocation(item, location) {
+  if (isQuantityEquipment(item)) return sameEquipmentLocation(item.location, location);
+  return equipmentInstances(item).some((instance) => sameEquipmentLocation(instance.location, location));
 }
 
 function renderEquipmentResults() {
   const query = ui.equipmentSearch.trim().toLocaleLowerCase("ru");
-  const groupItems = state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup);
+  const groupItems = ui.equipmentLocation
+    ? state.equipment.filter((item) => equipmentHasLocation(item, ui.equipmentLocation))
+    : state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup);
   const items = groupItems.map((item) => {
+    if (isQuantityEquipment(item)) {
+      const condition = Object.hasOwn(equipmentConditions, item.condition) ? item.condition : "READY";
+      const comment = typeof item.comment === "string" ? item.comment : item.notes || "";
+      const total = Number.isSafeInteger(item.quantity) && item.quantity > 0 ? item.quantity : 1;
+      const matches = (!ui.equipmentLocation || sameEquipmentLocation(item.location, ui.equipmentLocation))
+        && (!ui.equipmentCondition || condition === ui.equipmentCondition)
+        && (!query || [item.name, item.category, item.location, comment, equipmentConditions[condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
+      return matches ? { item, instances: [], total, quantityOnly: true, condition, comment } : null;
+    }
     const allInstances = equipmentInstances(item);
     const instances = allInstances.map((instance, index) => ({ ...instance, index }))
+      .filter((instance) => !ui.equipmentLocation || sameEquipmentLocation(instance.location, ui.equipmentLocation))
       .filter((instance) => !ui.equipmentCondition || instance.condition === ui.equipmentCondition)
-      .filter((instance) => !query || [item.name, item.category, item.notes, instance.inventoryNumber, instance.location, equipmentConditions[instance.condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
-    return { item, instances, total: allInstances.length };
-  }).filter(({ instances }) => instances.length)
+      .filter((instance) => !query || [item.name, item.category, instance.inventoryNumber, instance.location, instance.comment, equipmentConditions[instance.condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
+    return instances.length ? { item, instances, total: allInstances.length, quantityOnly: false } : null;
+  }).filter(Boolean)
     .sort((a, b) => (ui.equipmentSort === "desc" ? -1 : 1) * a.item.name.localeCompare(b.item.name, "ru", { numeric: true, sensitivity: "base" }));
-  if (!items.length) return `<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
+  if (!items.length) return `<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : ui.equipmentLocation ? `В месте хранения «${escapeHtml(ui.equipmentLocation)}» оборудование не найдено` : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : ui.equipmentLocation ? "Проверьте место хранения у нужного экземпляра." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
   return `
     <p class="muted small" role="status">Найдено позиций: ${items.length}</p>
-    <div class="equipment-list">${items.map(({ item, instances, total }) => {
-      return `<article class="panel equipment-card">
-        <div class="equipment-card-heading"><h2>${escapeHtml(item.name)}</h2></div>
-        <dl class="equipment-details">
-          <div><dt>Количество</dt><dd>${total} ${escapeHtml(item.unit || "шт.")}</dd></div>
-          <div><dt>Категория</dt><dd>${escapeHtml(item.category || "Не указана")}</dd></div>
-        </dl>
-        ${instances.length < total ? `<p class="muted small">Показано экземпляров: ${instances.length} из ${total}</p>` : ""}
-        <ol class="equipment-instance-list">${instances.map((instance) => `<li>
-          <div class="equipment-card-heading"><strong>Экземпляр ${instance.index + 1}</strong><span class="chip ${equipmentConditions[instance.condition].color}">${equipmentConditions[instance.condition].label}</span></div>
+    <div class="equipment-list">${items.map(({ item, instances, total, quantityOnly, condition, comment }) => {
+      const collapsed = ui.collapsedEquipmentIds.includes(item.id);
+      const bodyId = `equipment-card-body-${item.id}`;
+      return `<article class="panel equipment-card${collapsed ? " collapsed" : ""}">
+        <button class="equipment-card-toggle" data-toggle-equipment="${escapeAttr(item.id)}" type="button" aria-expanded="${!collapsed}" aria-controls="${escapeAttr(bodyId)}">
+          <h2>${escapeHtml(item.name)}</h2>
+          <span class="equipment-card-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div class="equipment-card-body" id="${escapeAttr(bodyId)}" ${collapsed ? "hidden" : ""}>
           <dl class="equipment-details">
-            <div><dt>Инвентарный / заводской номер</dt><dd>${escapeHtml(instance.inventoryNumber || "Не указан")}</dd></div>
-            <div><dt>Место хранения</dt><dd>${escapeHtml(instance.location || "Не указано")}</dd></div>
+            <div><dt>Количество</dt><dd>${total} ${escapeHtml(item.unit || "шт.")}</dd></div>
+            <div><dt>Категория</dt><dd>${escapeHtml(item.category || "Не указана")}</dd></div>
+            ${ui.equipmentLocation ? `<div><dt>Раздел</dt><dd>${escapeHtml(equipmentGroups[equipmentGroup(item)])}</dd></div>` : ""}
           </dl>
-        </li>`).join("")}</ol>
-        ${item.notes ? `<p class="equipment-notes">${escapeHtml(item.notes)}</p>` : ""}
-        <button class="ghost-btn" data-edit-equipment="${escapeAttr(item.id)}" type="button" aria-label="Изменить: ${escapeAttr(item.name)}">Изменить</button>
+          ${quantityOnly ? `
+            <div class="equipment-quantity-entry">
+              <div class="equipment-card-heading"><strong>Учёт количеством</strong><span class="chip ${equipmentConditions[condition].color}">${equipmentConditions[condition].label}</span></div>
+              <dl class="equipment-details"><div><dt>Место хранения</dt><dd>${escapeHtml(item.location || "Не указано")}</dd></div></dl>
+              ${comment ? `<p class="equipment-notes"><strong>Комментарий:</strong> ${escapeHtml(comment)}</p>` : ""}
+            </div>
+          ` : `
+          ${instances.length < total ? `<p class="muted small">Показано экземпляров: ${instances.length} из ${total}</p>` : ""}
+          <ol class="equipment-instance-list">${instances.map((instance) => `<li>
+            <div class="equipment-card-heading"><strong>Экземпляр ${instance.index + 1}</strong><span class="chip ${equipmentConditions[instance.condition].color}">${equipmentConditions[instance.condition].label}</span></div>
+            <dl class="equipment-details">
+              <div><dt>Инвентарный / заводской номер</dt><dd>${escapeHtml(instance.inventoryNumber || "Не указан")}</dd></div>
+              <div><dt>Место хранения</dt><dd>${escapeHtml(instance.location || "Не указано")}</dd></div>
+            </dl>
+            ${instance.comment ? `<p class="equipment-notes"><strong>Комментарий:</strong> ${escapeHtml(instance.comment)}</p>` : ""}
+          </li>`).join("")}</ol>`}
+          ${can("work.edit") ? `<button class="ghost-btn" data-edit-equipment="${escapeAttr(item.id)}" type="button" aria-label="Изменить: ${escapeAttr(item.name)}">Изменить</button>` : ""}
+        </div>
       </article>`;
     }).join("")}</div>
   `;
@@ -806,6 +1190,7 @@ function renderEquipmentInstanceFields(instance = {}, index = 0) {
     <div class="field-group"><label for="${fieldId}-number">Инвентарный / заводской номер</label><input id="${fieldId}-number" class="field" name="instanceNumber" maxlength="100" value="${escapeAttr(instance.inventoryNumber || "")}" /></div>
     <div class="field-group"><label for="${fieldId}-location">Место хранения</label><input id="${fieldId}-location" class="field" name="instanceLocation" maxlength="160" value="${escapeAttr(instance.location || "")}" placeholder="Например: склад, стеллаж 2" /></div>
     <div class="field-group"><label for="${fieldId}-condition">Состояние</label><select id="${fieldId}-condition" class="field" name="instanceCondition">${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${(instance.condition || "READY") === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
+    <div class="field-group"><label for="${fieldId}-comment">Комментарий</label><textarea id="${fieldId}-comment" class="field" name="instanceComment" maxlength="1000" placeholder="Комплектация, особенности, замечания">${escapeHtml(instance.comment || "")}</textarea></div>
     <button class="danger-btn" data-remove-instance type="button">Удалить экземпляр</button>
   </fieldset>`;
 }
@@ -813,14 +1198,25 @@ function renderEquipmentInstanceFields(instance = {}, index = 0) {
 function bindEquipmentInstances() {
   const list = document.querySelector("[data-equipment-instances]");
   if (!list) return;
+  const form = list.closest("form");
+  const trackingMode = form.querySelector("[data-equipment-tracking-mode]");
+  const quantity = form.querySelector("#equipment-quantity");
   const updateQuantity = () => {
     const rows = list.querySelectorAll("[data-equipment-instance]");
-    document.querySelector("#equipment-quantity").value = rows.length;
+    if (trackingMode.value === "instances") quantity.value = rows.length;
     rows.forEach((row, index) => {
       row.querySelector("[data-instance-number]").textContent = index + 1;
       row.querySelector("[data-remove-instance]").disabled = rows.length === 1;
     });
   };
+  const updateTrackingMode = () => {
+    const quantityOnly = trackingMode.value === "quantity";
+    form.querySelector("[data-instance-mode-fields]").hidden = quantityOnly;
+    form.querySelector("[data-quantity-mode-fields]").hidden = !quantityOnly;
+    quantity.readOnly = !quantityOnly;
+    if (!quantityOnly) updateQuantity();
+  };
+  trackingMode.addEventListener("change", updateTrackingMode);
   document.querySelector("[data-add-instance]").addEventListener("click", () => {
     list.insertAdjacentHTML("beforeend", renderEquipmentInstanceFields({}, list.children.length));
     updateQuantity();
@@ -833,12 +1229,16 @@ function bindEquipmentInstances() {
     updateQuantity();
   });
   updateQuantity();
+  updateTrackingMode();
 }
 
 function renderEquipmentFormModal() {
   const item = state.equipment.find((entry) => entry.id === ui.modal.equipmentId);
   const data = item || { quantity: 1, unit: "шт.", condition: "READY" };
-  const instances = equipmentInstances(data);
+  const trackingMode = isQuantityEquipment(data) ? "quantity" : "instances";
+  const instances = trackingMode === "quantity"
+    ? [{ inventoryNumber: "", location: data.location || "", condition: data.condition || "READY", comment: data.comment || data.notes || "" }]
+    : equipmentInstances(data);
   const group = item ? equipmentGroup(item) : ui.equipmentGroup;
   return `
     <div class="modal-backdrop"><form class="modal" data-equipment-form>
@@ -847,14 +1247,22 @@ function renderEquipmentFormModal() {
         <div class="field-group"><label for="equipment-group">Раздел</label><select id="equipment-group" class="field" name="group">${Object.entries(equipmentGroups).map(([key, label]) => `<option value="${key}" ${key === group ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></div>
         <div class="field-group"><label for="equipment-name">Наименование</label><input id="equipment-name" class="field" name="name" required maxlength="160" value="${escapeAttr(data.name || "")}" placeholder="Например: пожарный рукав" /></div>
         <div class="field-group"><label for="equipment-category">Категория</label><input id="equipment-category" class="field" name="category" maxlength="100" value="${escapeAttr(data.category || "")}" placeholder="Например: рукавное оборудование" /></div>
+        <div class="field-group"><label for="equipment-tracking-mode">Способ учёта</label><select id="equipment-tracking-mode" class="field" name="trackingMode" data-equipment-tracking-mode><option value="instances" ${trackingMode === "instances" ? "selected" : ""}>По экземплярам</option><option value="quantity" ${trackingMode === "quantity" ? "selected" : ""}>Только количество</option></select></div>
         <div class="equipment-form-grid">
-          <div class="field-group"><label for="equipment-quantity">Количество</label><input id="equipment-quantity" class="field" name="quantity" type="number" readonly value="${instances.length}" /></div>
+          <div class="field-group"><label for="equipment-quantity">Количество</label><input id="equipment-quantity" class="field" name="quantity" type="number" min="1" max="1000000" ${trackingMode === "instances" ? "readonly" : ""} value="${trackingMode === "quantity" ? Number(data.quantity) || 1 : instances.length}" /></div>
           <div class="field-group"><label for="equipment-unit">Единица учёта</label><input id="equipment-unit" class="field" name="unit" required maxlength="20" value="${escapeAttr(data.unit || "шт.")}" placeholder="шт., комплект" /></div>
         </div>
-        <p class="muted small">У каждого экземпляра — свой номер, место хранения и состояние. Количество рассчитывается автоматически.</p>
-        <div class="equipment-instances" data-equipment-instances>${instances.map(renderEquipmentInstanceFields).join("")}</div>
-        <button class="ghost-btn equipment-add-instance" data-add-instance type="button">+ Добавить экземпляр</button>
-        <div class="field-group"><label for="equipment-notes">Примечание</label><textarea id="equipment-notes" class="field" name="notes" maxlength="2000" placeholder="Комплектация, особенности, замечания">${escapeHtml(data.notes || "")}</textarea></div>
+        <div data-instance-mode-fields ${trackingMode === "quantity" ? "hidden" : ""}>
+          <p class="muted small">У каждого экземпляра — свой номер, место хранения, состояние и комментарий. Количество рассчитывается автоматически.</p>
+          <div class="equipment-instances" data-equipment-instances>${instances.map(renderEquipmentInstanceFields).join("")}</div>
+          <button class="ghost-btn equipment-add-instance" data-add-instance type="button">+ Добавить экземпляр</button>
+        </div>
+        <div data-quantity-mode-fields ${trackingMode === "instances" ? "hidden" : ""}>
+          <p class="muted small">Для однотипного имущества достаточно общего количества без создания отдельных экземпляров.</p>
+          <div class="field-group"><label for="equipment-bulk-location">Место хранения</label><input id="equipment-bulk-location" class="field" name="bulkLocation" maxlength="160" value="${escapeAttr(data.location || "")}" placeholder="Например: АЦ 720 или склад" /></div>
+          <div class="field-group"><label for="equipment-bulk-condition">Состояние</label><select id="equipment-bulk-condition" class="field" name="bulkCondition">${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${(data.condition || "READY") === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
+          <div class="field-group"><label for="equipment-bulk-comment">Комментарий</label><textarea id="equipment-bulk-comment" class="field" name="bulkComment" maxlength="1000" placeholder="Комплектация, особенности, замечания">${escapeHtml(data.comment || data.notes || "")}</textarea></div>
+        </div>
         <p class="form-error small" data-equipment-error role="alert" hidden></p>
         <div class="actions"><button class="btn" type="submit">Сохранить</button>${item ? `<button class="danger-btn" data-delete-equipment="${escapeAttr(item.id)}" type="button">Удалить</button>` : ""}</div>
       </div>
@@ -918,8 +1326,9 @@ function bindWorkEvents() {
   });
   document.querySelectorAll("[data-equipment-group]").forEach((button) => {
     button.addEventListener("click", () => {
-      if (ui.equipmentGroup === button.dataset.equipmentGroup) return;
+      if (!ui.equipmentLocation && ui.equipmentGroup === button.dataset.equipmentGroup) return;
       ui.equipmentGroup = button.dataset.equipmentGroup;
+      ui.equipmentLocation = "";
       ui.equipmentSearch = "";
       ui.equipmentCondition = "";
       render();
@@ -945,6 +1354,13 @@ function bindWorkEvents() {
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
     saveUiState();
   });
+  document.querySelector("[data-equipment-location]")?.addEventListener("change", (event) => {
+    ui.equipmentLocation = event.target.value;
+    ui.equipmentSearch = "";
+    ui.equipmentCondition = "";
+    render();
+    saveUiState();
+  });
   document.querySelector("[data-equipment-condition]")?.addEventListener("change", (event) => {
     ui.equipmentCondition = event.target.value;
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
@@ -956,6 +1372,20 @@ function bindWorkEvents() {
     saveUiState();
   });
   document.querySelector("[data-equipment-results]")?.addEventListener("click", (event) => {
+    const toggle = event.target.closest("[data-toggle-equipment]");
+    if (toggle) {
+      const id = toggle.dataset.toggleEquipment;
+      ui.collapsedEquipmentIds = ui.collapsedEquipmentIds.includes(id)
+        ? ui.collapsedEquipmentIds.filter((itemId) => itemId !== id)
+        : [...ui.collapsedEquipmentIds, id];
+      const body = document.getElementById(toggle.getAttribute("aria-controls"));
+      const collapsed = ui.collapsedEquipmentIds.includes(id);
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      body.hidden = collapsed;
+      toggle.closest(".equipment-card").classList.toggle("collapsed", collapsed);
+      saveUiState();
+      return;
+    }
     const button = event.target.closest("[data-edit-equipment]");
     if (!button) return;
     ui.modal = { type: "equipmentForm", equipmentId: button.dataset.editEquipment };
@@ -966,29 +1396,52 @@ function bindWorkEvents() {
 function saveEquipmentFromForm(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
-  const values = Object.fromEntries(["name", "group", "category", "unit", "notes"].map((key) => [key, String(form.get(key) || "").trim()]));
+  const values = Object.fromEntries(["name", "group", "category", "unit"].map((key) => [key, String(form.get(key) || "").trim()]));
+  const trackingMode = form.get("trackingMode") === "quantity" ? "quantity" : "instances";
   const locations = form.getAll("instanceLocation");
   const conditions = form.getAll("instanceCondition");
+  const comments = form.getAll("instanceComment");
   const instances = form.getAll("instanceNumber").map((inventoryNumber, index) => ({
     inventoryNumber: String(inventoryNumber || "").trim(),
     location: String(locations[index] || "").trim(),
-    condition: String(conditions[index] || "")
+    condition: String(conditions[index] || ""),
+    comment: String(comments[index] || "").trim()
   }));
-  const quantity = instances.length;
-  if (!values.name || !values.unit || !Object.hasOwn(equipmentGroups, values.group) || !Number.isSafeInteger(quantity) || quantity < 1 || instances.some((instance) => !Object.hasOwn(equipmentConditions, instance.condition))) {
+  const quantity = trackingMode === "quantity" ? Number(form.get("quantity")) : instances.length;
+  const bulkCondition = String(form.get("bulkCondition") || "");
+  const invalidQuantityItem = trackingMode === "quantity" && (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1_000_000 || !Object.hasOwn(equipmentConditions, bulkCondition));
+  const invalidInstanceItem = trackingMode === "instances" && (!instances.length || instances.some((instance) => !Object.hasOwn(equipmentConditions, instance.condition)));
+  if (!values.name || !values.unit || !Object.hasOwn(equipmentGroups, values.group) || invalidQuantityItem || invalidInstanceItem) {
     const error = event.currentTarget.querySelector("[data-equipment-error]");
-    error.textContent = "Укажите название, единицу учёта и добавьте хотя бы один экземпляр с выбранным состоянием.";
+    error.textContent = trackingMode === "quantity"
+      ? "Укажите название, единицу учёта, количество от 1 до 1 000 000 и состояние."
+      : "Укажите название, единицу учёта и добавьте хотя бы один экземпляр с выбранным состоянием.";
     error.hidden = false;
     return;
   }
   const existing = state.equipment.find((item) => item.id === ui.modal.equipmentId);
   const now = new Date().toISOString();
+  const equipmentData = trackingMode === "quantity"
+    ? {
+        ...values,
+        trackingMode,
+        quantity,
+        location: normalizedEquipmentLocation(form.get("bulkLocation")),
+        condition: bulkCondition,
+        comment: String(form.get("bulkComment") || "").trim()
+      }
+    : { ...values, trackingMode, instances, quantity };
   if (existing) {
-    Object.assign(existing, values, { instances, quantity, updatedAt: now });
+    Object.assign(existing, equipmentData, { updatedAt: now });
     delete existing.inventoryNumber;
-    delete existing.location;
-    delete existing.condition;
-  } else state.equipment.push({ id: createId("equipment"), ...values, instances, quantity, createdAt: now, updatedAt: now });
+    delete existing.notes;
+    if (trackingMode === "quantity") delete existing.instances;
+    else {
+      delete existing.location;
+      delete existing.condition;
+      delete existing.comment;
+    }
+  } else state.equipment.push({ id: createId("equipment"), ...equipmentData, createdAt: now, updatedAt: now });
   if (ui.equipmentGroup !== values.group) {
     ui.equipmentGroup = values.group;
     ui.equipmentSearch = "";
@@ -1120,15 +1573,31 @@ function renderEmployeePickerSheet() {
   const { assignmentType, position, query = "" } = ui.sheet;
   const roster = getRoster();
   const currentId = getAssignment(roster, assignmentType, position);
-  const rows = state.employees
+  const block = roster.blocks.find((item) => item.id === assignmentType);
+  const isReservePicker = isReserveDriverTitle(block?.title);
+  const reserveHistory = isReservePicker ? reserveDriverHistoryBefore(ui.selectedDate) : new Map();
+  const eligibleEmployees = state.employees
     .filter((employee) => employee.isActive)
-    .filter((employee) => !query || employeeSearchText(employee).includes(query.toLowerCase()))
+    .filter((employee) => !isReservePicker || (isDriverPosition(employee.position) && !getAbsenceForDate(employee.id, ui.selectedDate)))
     .sort((a, b) => {
+      if (isReservePicker) {
+        const currentDiff = Number(b.id === currentId) - Number(a.id === currentId);
+        if (currentDiff) return currentDiff;
+        const aLastDate = reserveHistory.get(a.id) || "";
+        const bLastDate = reserveHistory.get(b.id) || "";
+        const historyDiff = aLastDate.localeCompare(bLastDate);
+        if (historyDiff) return historyDiff;
+        return compareEmployeesByName(a, b);
+      }
       const aSelected = allEmployeeAssignments(roster, a.id).length ? 1 : 0;
       const bSelected = allEmployeeAssignments(roster, b.id).length ? 1 : 0;
       if (aSelected !== bSelected) return bSelected - aSelected;
       return a.lastName.localeCompare(b.lastName, "ru");
     });
+  const recommendedId = isReservePicker
+    ? eligibleEmployees.find((employee) => employee.id !== currentId)?.id || (currentId ? "" : eligibleEmployees[0]?.id)
+    : "";
+  const rows = eligibleEmployees.filter((employee) => !query || employeeSearchText(employee).includes(query.toLowerCase()));
 
   return `
     <div class="sheet-backdrop" data-close-sheet>
@@ -1142,6 +1611,7 @@ function renderEmployeePickerSheet() {
         </div>
         <div class="sheet-body">
           <input class="search" data-picker-search placeholder="Поиск по фамилии" value="${escapeAttr(query)}" />
+          ${isReservePicker ? `<p class="picker-hint">Показаны водители без отсутствия на выбранную дату. Первыми идут те, кто ещё не был резервным или был им раньше остальных.</p>` : ""}
           ${currentId ? `<button class="danger-btn" data-clear-assignment type="button" style="width:100%;margin-top:10px">Очистить назначение</button>` : ""}
           <div class="picker-list">
             ${rows.map((employee) => {
@@ -1152,16 +1622,18 @@ function renderEmployeePickerSheet() {
                 ? selectedIn.map((item) => item.assignmentType === assignmentType && item.position === position ? "Выбран здесь" : assignmentTitle(item.assignmentType)).join(", ")
                 : absence ? absenceStatusLabel(absence) : "";
               const className = selectedIn.length ? "selected" : absence ? "warn" : "";
+              const lastReserveDate = reserveHistory.get(employee.id);
               return `
                 <button class="picker-option ${className}" data-select-employee="${employee.id}" type="button">
                   <span>
                     <span class="row-title">${escapeHtml(employee.shortName)}</span>
                     <span class="row-subtitle role-line">${employeeRoleHtml(employee)}</span>
+                    ${isReservePicker ? `<span class="row-subtitle reserve-history">${lastReserveDate ? `Последний резерв: ${formatShortDate(reserveDriverDutyDate(lastReserveDate))}` : "Ещё не был резервным"}</span>` : ""}
                   </span>
-                  ${marker ? `<span class="chip">${marker}</span>` : ""}
+                  ${(marker || employee.id === recommendedId) ? `<span class="picker-chips">${employee.id === recommendedId ? `<span class="chip green">Следующий</span>` : ""}${marker ? `<span class="chip">${marker}</span>` : ""}</span>` : ""}
                 </button>
               `;
-            }).join("")}
+            }).join("") || `<div class="empty-state">${isReservePicker ? "Нет доступных водителей без отсутствия." : "Сотрудники не найдены."}</div>`}
           </div>
         </div>
       </section>
@@ -1202,10 +1674,49 @@ function renderStatusPickerSheet() {
 function renderModal() {
   if (ui.modal.type === "equipmentGroups") return renderEquipmentGroupsModal();
   if (ui.modal.type === "equipmentForm") return renderEquipmentFormModal();
+  if (ui.modal.type.startsWith("access")) return renderAccessModal();
   if (ui.modal.type === "preview") return renderPreviewModal();
   if (ui.modal.type === "titleForm") return renderTitleFormModal();
   if (ui.modal.type === "blockForm") return renderBlockFormModal();
   if (ui.modal.type === "employeeForm") return renderEmployeeFormModal();
+  return "";
+}
+
+function renderAccessModal() {
+  const roles = auth.access?.roles || [];
+  const editableRoles = roles.filter((role) => role.system !== "owner");
+  if (ui.modal.type === "accessGuardCreate") return `
+    <div class="modal-backdrop"><form class="modal access-modal" data-access-create-guard>
+      <div class="modal-head"><h2>Новый караул</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body"><div class="field-group"><label for="access-guard-name">Название караула</label><input id="access-guard-name" class="field" name="name" required maxlength="80" placeholder="Например, 1-й караул" autofocus /></div><div class="actions"><button class="btn" type="submit">Создать</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div>
+    </form></div>`;
+  if (ui.modal.type === "accessGuardRename") return `
+    <div class="modal-backdrop"><form class="modal access-modal" data-access-rename-guard>
+      <div class="modal-head"><h2>Переименовать караул</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body"><div class="field-group"><label for="access-guard-rename">Название караула</label><input id="access-guard-rename" class="field" name="name" required maxlength="80" value="${escapeAttr(auth.session.guard.name)}" autofocus /></div><div class="actions"><button class="btn" type="submit">Сохранить</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div>
+    </form></div>`;
+  if (ui.modal.type === "accessMemberAdd") return `
+    <div class="modal-backdrop"><form class="modal access-modal" data-access-add-member>
+      <div class="modal-head"><h2>Добавить участника</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body"><p class="muted small">Пользователь должен сначала зарегистрироваться.</p><div class="field-group"><label for="access-member-login">Логин</label><input id="access-member-login" class="field" name="login" required placeholder="Логин пользователя" autofocus /></div><div class="field-group"><label for="access-member-role">Роль</label><select id="access-member-role" class="field" name="roleId" required>${roleOptions(editableRoles)}</select></div><div class="actions"><button class="btn" type="submit">Добавить</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div>
+    </form></div>`;
+  if (ui.modal.type === "accessInviteCreate") return `
+    <div class="modal-backdrop"><section class="modal access-modal">
+      <div class="modal-head"><h2>Приглашение</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body">${auth.inviteUrl
+        ? `<p class="muted small">Ссылка действует семь дней и используется один раз.</p><div class="invite-result"><input class="field" readonly value="${escapeAttr(auth.inviteUrl)}" aria-label="Ссылка-приглашение" /><button class="btn" data-copy-invite type="button">Копировать</button></div>`
+        : `<form data-access-create-invite><div class="field-group"><label for="access-invite-role">Роль приглашённого</label><select id="access-invite-role" class="field" name="roleId" required>${roleOptions(editableRoles)}</select></div><div class="actions"><button class="btn" type="submit">Создать ссылку</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></form>`}</div>
+    </section></div>`;
+  if (ui.modal.type === "accessRoleCreate") return `
+    <div class="modal-backdrop"><form class="modal access-modal" data-access-create-role>
+      <div class="modal-head"><h2>Новая роль</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body"><div class="field-group"><label for="access-role-name">Название роли</label><input id="access-role-name" class="field" name="name" required maxlength="60" placeholder="Например, Дежурный" autofocus /></div>${permissionCheckboxes([])}<div class="actions access-modal-actions"><button class="btn" type="submit">Создать роль</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div>
+    </form></div>`;
+  if (ui.modal.type === "accessConfirm") return `
+    <div class="modal-backdrop"><section class="modal access-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="access-confirm-title">
+      <div class="modal-head"><h2 id="access-confirm-title">Подтвердите действие</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+      <div class="modal-body"><p>${escapeHtml(ui.modal.message || "Выполнить действие?")}</p><div class="actions access-modal-actions"><button class="danger-btn" data-access-confirm type="button">${escapeHtml(ui.modal.confirmLabel || "Удалить")}</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div>
+    </section></div>`;
   return "";
 }
 
@@ -1433,13 +1944,16 @@ function bindEvents() {
     ui.view = button.dataset.view;
     ui.sheet = null;
     ui.modal = null;
+    if (ui.view === "access") auth.access = null;
     render();
+    if (ui.view === "access") loadAccessData();
   }));
 
   bindRosterEvents();
   bindStatsEvents();
   bindEmployeeEvents();
   bindWorkEvents();
+  bindAccessEvents();
   bindSheetEvents();
   bindModalEvents();
 }
@@ -1527,6 +2041,145 @@ function bindEmployeeEvents() {
     ui.modal = { type: "employeeForm", employeeId: button.dataset.editEmployee };
     render();
   }));
+}
+
+async function applyAccessRequest(path, options) {
+  try {
+    const result = await apiRequest(path, options);
+    auth.access = result;
+    auth.session = { ...auth.session, ...result };
+    render();
+    return result;
+  } catch (error) {
+    showToast(error.message);
+    return null;
+  }
+}
+
+function bindAccessEvents() {
+  document.querySelector("[data-logout]")?.addEventListener("click", logout);
+  document.querySelector("[data-guard-select]")?.addEventListener("change", (event) => selectGuard(event.target.value));
+  document.querySelectorAll("[data-open-access-modal]").forEach((button) => button.addEventListener("click", () => {
+    const modalTypes = { guardCreate: "accessGuardCreate", guardRename: "accessGuardRename", memberAdd: "accessMemberAdd", inviteCreate: "accessInviteCreate", roleCreate: "accessRoleCreate" };
+    if (button.dataset.openAccessModal === "inviteCreate") auth.inviteUrl = "";
+    ui.modal = { type: modalTypes[button.dataset.openAccessModal] };
+    render();
+  }));
+  document.querySelectorAll("[data-toggle-access-member]").forEach((button) => button.addEventListener("click", () => {
+    const id = button.dataset.toggleAccessMember;
+    ui.accessExpandedMemberId = ui.accessExpandedMemberId === id ? "" : id;
+    ui.accessExpandedRoleId = "";
+    render();
+  }));
+  document.querySelectorAll("[data-toggle-access-role]").forEach((button) => button.addEventListener("click", () => {
+    const id = button.dataset.toggleAccessRole;
+    ui.accessExpandedRoleId = ui.accessExpandedRoleId === id ? "" : id;
+    ui.accessExpandedMemberId = "";
+    render();
+  }));
+  document.querySelectorAll("[data-member-role]").forEach((select) => select.addEventListener("change", () => {
+    applyAccessRequest(`/api/members/${encodeURIComponent(select.dataset.memberRole)}`, { method: "PUT", body: JSON.stringify({ roleId: select.value }) });
+  }));
+  document.querySelectorAll("[data-confirm-remove-member]").forEach((button) => button.addEventListener("click", () => {
+    const member = auth.access.members.find((item) => item.id === button.dataset.confirmRemoveMember);
+    if (!member) return;
+    ui.modal = { type: "accessConfirm", action: "removeMember", id: member.id, message: `Удалить участника «${member.user.login}» из караула? Он потеряет доступ к данным этого караула.`, confirmLabel: "Удалить участника" };
+    render();
+  }));
+  document.querySelectorAll("[data-confirm-revoke-invite]").forEach((button) => button.addEventListener("click", () => {
+    const invite = auth.access.invites.find((item) => item.id === button.dataset.confirmRevokeInvite);
+    if (!invite) return;
+    ui.modal = { type: "accessConfirm", action: "revokeInvite", id: invite.id, message: `Отозвать приглашение для роли «${invite.roleName}»? Ссылка перестанет работать.`, confirmLabel: "Отозвать" };
+    render();
+  }));
+  document.querySelectorAll("[data-role-form]").forEach((form) => form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    applyAccessRequest(`/api/roles/${encodeURIComponent(form.dataset.roleForm)}`, { method: "PUT", body: JSON.stringify({ name: data.get("name"), permissions: data.getAll("permissions") }) });
+  }));
+  document.querySelectorAll("[data-confirm-delete-role]").forEach((button) => button.addEventListener("click", () => {
+    const role = auth.access.roles.find((item) => item.id === button.dataset.confirmDeleteRole);
+    if (!role) return;
+    ui.modal = { type: "accessConfirm", action: "deleteRole", id: role.id, message: `Удалить роль «${role.name}»? Удаление возможно, если эта роль не назначена участникам.`, confirmLabel: "Удалить роль" };
+    render();
+  }));
+}
+
+function bindAccessModalEvents() {
+  document.querySelector("[data-access-create-guard]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    try {
+      await createGuard(name);
+      ui.modal = null;
+      showToast("Караул создан");
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+  document.querySelector("[data-access-rename-guard]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    try {
+      auth.session = await apiRequest("/api/guards/current", { method: "PUT", body: JSON.stringify({ name }) });
+      ui.modal = null;
+      await loadAccessData();
+      showToast("Название сохранено");
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+  document.querySelector("[data-access-add-member]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const result = await applyAccessRequest("/api/members", { method: "POST", body: JSON.stringify(values) });
+    if (!result) return;
+    ui.modal = null;
+    showToast("Участник добавлен");
+  });
+  document.querySelector("[data-access-create-invite]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const roleId = String(new FormData(event.currentTarget).get("roleId") || "");
+    const result = await applyAccessRequest("/api/invites", { method: "POST", body: JSON.stringify({ roleId }) });
+    if (!result?.inviteUrl) return;
+    auth.inviteUrl = result.inviteUrl;
+    render();
+  });
+  document.querySelector("[data-access-create-role]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const name = String(data.get("name") || "");
+    const result = await applyAccessRequest("/api/roles", { method: "POST", body: JSON.stringify({ name, permissions: data.getAll("permissions") }) });
+    if (!result) return;
+    const created = result.roles.find((role) => role.name === name);
+    ui.accessExpandedRoleId = created?.id || "";
+    ui.modal = null;
+    showToast("Роль создана");
+  });
+  document.querySelector("[data-copy-invite]")?.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(auth.inviteUrl);
+      showToast("Ссылка скопирована");
+    } catch {
+      showToast("Скопируйте ссылку из поля вручную");
+    }
+  });
+  document.querySelector("[data-access-confirm]")?.addEventListener("click", async () => {
+    const { action, id } = ui.modal;
+    const requests = {
+      removeMember: [`/api/members/${encodeURIComponent(id)}`, "Участник удалён"],
+      deleteRole: [`/api/roles/${encodeURIComponent(id)}`, "Роль удалена"],
+      revokeInvite: [`/api/invites/${encodeURIComponent(id)}`, "Приглашение отозвано"]
+    };
+    const request = requests[action];
+    if (!request) return;
+    const result = await applyAccessRequest(request[0], { method: "DELETE" });
+    if (!result) return;
+    if (action === "removeMember") ui.accessExpandedMemberId = "";
+    if (action === "deleteRole") ui.accessExpandedRoleId = "";
+    ui.modal = null;
+    showToast(request[1]);
+  });
 }
 
 function bindSheetEvents() {
@@ -1620,6 +2273,7 @@ function bindModalEvents() {
   document.querySelector("[data-block-form]")?.addEventListener("submit", saveBlockFromForm);
   document.querySelector("[data-employee-form]")?.addEventListener("submit", saveEmployeeFromForm);
   document.querySelector("[data-equipment-form]")?.addEventListener("submit", saveEquipmentFromForm);
+  bindAccessModalEvents();
   bindEquipmentInstances();
   bindEquipmentGroupsForm();
   document.querySelector("[data-delete-equipment]")?.addEventListener("click", (event) => deleteEquipment(event.currentTarget.dataset.deleteEquipment));
@@ -2388,7 +3042,25 @@ function createId(prefix) {
 }
 
 function reserveDriverLabel(date) {
-  return `Резервный водитель на ${formatDayMonth(isoDate(addDays(parseIsoDate(date), 2)))}`;
+  return `Резервный водитель на ${formatDayMonth(reserveDriverDutyDate(date))}`;
+}
+
+function reserveDriverDutyDate(rosterDate) {
+  return isoDate(addDays(parseIsoDate(rosterDate), 2));
+}
+
+function reserveDriverHistoryBefore(targetDate) {
+  const history = new Map();
+  Object.values(state.rosters || {}).forEach((roster) => {
+    if (!roster?.date || roster.date >= targetDate) return;
+    normalizeRoster(roster).blocks
+      .filter((block) => isReserveDriverTitle(block.title))
+      .forEach((block) => block.members.filter(Boolean).forEach((employeeId) => {
+        const lastDate = history.get(employeeId);
+        if (!lastDate || roster.date > lastDate) history.set(employeeId, roster.date);
+      }));
+  });
+  return history;
 }
 
 function normalizeBlockTitle(title) {
@@ -2537,9 +3209,12 @@ app.addEventListener("scroll", (event) => {
 }, true);
 window.addEventListener("beforeunload", () => {
   saveUiState();
-  persist();
+  if (remoteStateLoaded) saveStateToServer(true);
 });
-window.addEventListener("pagehide", saveUiState);
+window.addEventListener("pagehide", () => {
+  saveUiState();
+  if (remoteStateLoaded) saveStateToServer(true);
+});
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") saveUiState();
 });
@@ -2550,4 +3225,4 @@ if ("serviceWorker" in navigator) {
 
 normalizeStatsDates();
 render();
-loadStateFromServer();
+initializeAuth();
