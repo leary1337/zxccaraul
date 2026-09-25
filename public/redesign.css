@@ -379,6 +379,11 @@ h2 {
   box-shadow: 0 -10px 30px rgba(0, 0, 0, .16);
 }
 
+.bottom-nav .nav-item {
+  flex: 1 1 0;
+  width: 0;
+}
+
 .nav-item {
   position: relative;
   gap: 5px;
