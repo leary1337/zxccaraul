@@ -26,7 +26,7 @@ const defaultEquipmentGroups = {
 };
 
 function equipmentGroup(item) {
-  return Object.hasOwn(equipmentGroups, item.group) ? item.group : "PTV";
+  return Object.hasOwn(equipmentGroups, item.group) ? item.group : "ungrouped";
 }
 
 const absenceLabels = {
@@ -144,7 +144,7 @@ let ui = {
   equipmentSearch: "",
   equipmentCondition: "",
   equipmentSort: "asc",
-  equipmentGroup: "PTV",
+  equipmentGroup: "",
   equipmentLocation: "",
   collapsedEquipmentIds: [],
   accessExpandedMemberId: "",
@@ -223,7 +223,8 @@ function blankState() {
     appTitle: "Караул",
     employees: [],
     equipment: [],
-    equipmentGroups: { ...defaultEquipmentGroups },
+    equipmentGroups: {},
+    equipmentGroupsConfigured: true,
     absences: [],
     templateBlocks: [],
     rosters: {}
@@ -246,8 +247,23 @@ function normalizeState(nextState) {
   const validGroups = savedGroups && typeof savedGroups === "object" && !Array.isArray(savedGroups)
     ? Object.entries(savedGroups).filter(([id, label]) => /^[A-Za-z0-9_-]+$/.test(id) && !["__proto__", "constructor", "prototype"].includes(id) && typeof label === "string" && label.trim())
     : [];
-  nextState.equipmentGroups = { ...defaultEquipmentGroups, ...Object.fromEntries(validGroups.map(([id, label]) => [id, label.trim().slice(0, 60)])) };
   nextState.equipment = Array.isArray(nextState.equipment) ? nextState.equipment : [];
+  const usedGroups = new Set(nextState.equipment.map((item) => item.group || "PTV"));
+  const groups = Object.fromEntries(validGroups
+    .filter(([id, label]) => nextState.equipmentGroupsConfigured || label !== defaultEquipmentGroups[id] || usedGroups.has(id))
+    .map(([id, label]) => [id, label.trim().slice(0, 60)]));
+  for (const item of nextState.equipment) {
+    const legacyGroup = item.group || "PTV";
+    if (!nextState.equipmentGroupsConfigured && defaultEquipmentGroups[legacyGroup]) {
+      groups[legacyGroup] ||= defaultEquipmentGroups[legacyGroup];
+      item.group = legacyGroup;
+    }
+    if (!Object.hasOwn(groups, item.group)) {
+      groups.ungrouped ||= "Без раздела";
+      item.group = "ungrouped";
+    }
+  }
+  nextState.equipmentGroups = groups;
   nextState.appTitle = String(nextState.appTitle || "Караул").trim() || "Караул";
   nextState.employees = nextState.employees.map((employee) => ({
     position: "",
@@ -317,7 +333,7 @@ async function loadStateFromServer() {
     if (Array.isArray(result.state?.employees)) {
       state = normalizeState(result.state);
       equipmentGroups = state.equipmentGroups;
-      if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = "PTV";
+      if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = Object.keys(equipmentGroups)[0] || "";
       if (auth.session?.canImportLegacy) {
         localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
         localStorage.removeItem(STORAGE_KEY);
@@ -1035,6 +1051,14 @@ function renderAccessView() {
 }
 
 function renderWorkView() {
+  if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = Object.keys(equipmentGroups)[0] || "";
+  if (!Object.keys(equipmentGroups).length) return `
+    <div class="page-title work-heading">
+      <div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
+      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button></div>` : ""}
+    </div>
+    <section class="panel"><div class="empty-state"><h2>Создайте свои разделы оборудования</h2><p>${can("work.edit") ? "Нажмите «Настроить разделы», добавьте нужные названия и сохраните. Затем можно добавлять оборудование." : "Разделы оборудования ещё не настроены."}</p></div></section>
+  `;
   const locations = equipmentStorageLocations();
   if (ui.equipmentLocation && !locations.includes(ui.equipmentLocation)) ui.equipmentLocation = "";
   const groupCount = state.equipment.filter((item) => equipmentGroup(item) === ui.equipmentGroup).length;
@@ -1312,6 +1336,7 @@ function bindEquipmentGroupsForm() {
       return;
     }
     state.equipmentGroups = Object.fromEntries(ids.map((id, index) => [id, labels[index]]));
+    state.equipmentGroupsConfigured = true;
     equipmentGroups = state.equipmentGroups;
     persist();
     ui.modal = null;

@@ -1077,6 +1077,7 @@ function projectAppState(value, context) {
   if (hasPermission(context, "work.view")) {
     projected.equipment = value.equipment || [];
     projected.equipmentGroups = value.equipmentGroups || {};
+    if (Object.hasOwn(value, "equipmentGroupsConfigured")) projected.equipmentGroupsConfigured = value.equipmentGroupsConfigured;
   }
   return projected;
 }
@@ -1089,7 +1090,7 @@ function mergeAuthorizedState(previousValue, submittedValue, context) {
   const sections = [
     { keys: ["appTitle"], edit: "guard.manage", view: true },
     { keys: ["employees"], edit: "employees.edit", view: ["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission)) },
-    { keys: ["equipment", "equipmentGroups"], edit: "work.edit", view: hasPermission(context, "work.view") },
+    { keys: ["equipment", "equipmentGroups", "equipmentGroupsConfigured"], edit: "work.edit", view: hasPermission(context, "work.view") },
     { keys: ["absences"], edit: "roster.edit", view: hasPermission(context, "roster.view") || hasPermission(context, "stats.view") },
     { keys: ["templateBlocks", "rosters"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
   ];
