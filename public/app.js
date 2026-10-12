@@ -142,11 +142,12 @@ let ui = {
   },
   employeeSearch: "",
   equipmentSearch: "",
+  equipmentTool: "",
   equipmentCondition: "",
   equipmentSort: "asc",
   equipmentGroup: "",
   equipmentLocation: "",
-  collapsedEquipmentIds: [],
+  expandedEquipmentIds: [],
   accessExpandedMemberId: "",
   accessExpandedRoleId: "",
   sending: false,
@@ -171,9 +172,6 @@ function restoreUiState() {
     if (saved.equipmentCondition === "" || Object.hasOwn(equipmentConditions, saved.equipmentCondition)) ui.equipmentCondition = saved.equipmentCondition;
     if (["asc", "desc"].includes(saved.equipmentSort)) ui.equipmentSort = saved.equipmentSort;
     if (typeof saved.equipmentLocation === "string") ui.equipmentLocation = saved.equipmentLocation;
-    if (Array.isArray(saved.collapsedEquipmentIds)) {
-      ui.collapsedEquipmentIds = saved.collapsedEquipmentIds.filter((id) => typeof id === "string");
-    }
     const stats = saved.stats;
     if (stats && typeof stats === "object") {
       for (const key of ["from", "to"]) if (validDate(stats[key])) ui.stats[key] = stats[key];
@@ -205,7 +203,6 @@ function saveUiState() {
       equipmentSort: ui.equipmentSort,
       equipmentGroup: ui.equipmentGroup,
       equipmentLocation: ui.equipmentLocation,
-      collapsedEquipmentIds: ui.collapsedEquipmentIds,
       stats: ui.stats,
       scroll: savedUiScroll
     }));
@@ -227,6 +224,7 @@ function blankState() {
     equipmentGroupsConfigured: true,
     absences: [],
     templateBlocks: [],
+    rosterCommentTemplates: [],
     rosters: {}
   };
 }
@@ -273,7 +271,21 @@ function normalizeState(nextState) {
     ...employee
   }));
   nextState.templateBlocks = normalizeTemplateBlocks(nextState.templateBlocks);
+  nextState.rosterCommentTemplates = normalizeCommentTemplates(nextState.rosterCommentTemplates);
   return nextState;
+}
+
+function normalizeCommentTemplates(templates) {
+  return Array.isArray(templates) ? templates.filter((item) => item && typeof item.text === "string" && item.text.trim()).map((item, index) => ({
+    id: typeof item.id === "string" ? item.id : `comment-template-${index}`,
+    text: item.text.trim().slice(0, 240),
+    weekday: Number.isInteger(item.weekday) && item.weekday >= 0 && item.weekday <= 6 ? item.weekday : null
+  })) : [];
+}
+
+function scheduledRosterComment(date) {
+  const weekday = parseIsoDate(date).getDay();
+  return normalizeCommentTemplates(state.rosterCommentTemplates).filter((item) => item.weekday === weekday).map((item) => item.text).join("\n").slice(0, 240);
 }
 
 function normalizeTemplateBlocks(blocks = []) {
@@ -284,6 +296,7 @@ function normalizeTemplateBlocks(blocks = []) {
 
 function normalizeRoster(roster) {
   roster.comment = String(roster.comment || "");
+  if (!roster.substitutions || typeof roster.substitutions !== "object" || Array.isArray(roster.substitutions)) roster.substitutions = {};
   if (!Array.isArray(roster.blocks)) {
     const blocks = [];
     const addLegacyBlock = (title, members = []) => {
@@ -333,6 +346,7 @@ async function loadStateFromServer() {
     if (Array.isArray(result.state?.employees)) {
       state = normalizeState(result.state);
       equipmentGroups = state.equipmentGroups;
+      ui.expandedEquipmentIds = [];
       if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = Object.keys(equipmentGroups)[0] || "";
       if (auth.session?.canImportLegacy) {
         localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
@@ -475,7 +489,11 @@ async function apiRequest(path, options = {}) {
     headers: options.body ? { "content-type": "application/json", ...(options.headers || {}) } : options.headers
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || "Ошибка запроса");
+  if (!response.ok) {
+    const error = new Error(result.error || "Ошибка запроса");
+    error.status = response.status;
+    throw error;
+  }
   return result;
 }
 
@@ -500,15 +518,23 @@ async function activateSession(session) {
   ensureAllowedView();
   const invite = new URLSearchParams(location.search).get("invite");
   if (invite) {
+    let discardInvite = false;
     try {
       auth.session = await apiRequest("/api/invites/accept", { method: "POST", body: JSON.stringify({ token: invite }) });
-      history.replaceState({}, "", location.pathname);
+      discardInvite = true;
       state = loadState();
       equipmentGroups = state.equipmentGroups;
       ensureAllowedView();
     } catch (error) {
+      discardInvite = [400, 404, 410].includes(error.status);
       auth.error = error.message;
-      ui.toast = error.message;
+      showToast(error.message);
+    } finally {
+      if (discardInvite) {
+        const cleanUrl = new URL(location.href);
+        cleanUrl.searchParams.delete("invite");
+        history.replaceState(history.state, "", `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`);
+      }
     }
   }
   if (!auth.session.guard) {
@@ -640,6 +666,7 @@ function getRoster(date = ui.selectedDate) {
     id: `roster-${date}`,
     date,
     blocks,
+    comment: scheduledRosterComment(date),
     status: "draft",
     version: 1,
     sentVersion: 0,
@@ -649,7 +676,7 @@ function getRoster(date = ui.selectedDate) {
   };
   if (!can("roster.edit")) return normalizeRoster(roster);
   state.rosters[date] = roster;
-  if (blocks.length) persist();
+  if (blocks.length || roster.comment) persist();
   return normalizeRoster(state.rosters[date]);
 }
 
@@ -723,8 +750,11 @@ function renderRosterView() {
   const roster = getRoster();
   const activeEmployeeIds = new Set(state.employees.filter((employee) => employee.isActive).map((employee) => employee.id));
   const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId).filter((id) => activeEmployeeIds.has(id)));
+  const substitutions = activeRosterSubstitutions(roster);
+  const replacedEmployeeIds = new Set(substitutions.map((person) => person.replacedEmployeeId).filter(Boolean));
+  const substituteIds = new Set(allAssignments(roster).map((item) => item.employeeId).filter((id) => roster.substitutions[id]));
   const absentEmployeeIds = new Set(state.employees
-    .filter((employee) => employee.isActive && !assignedEmployeeIds.has(employee.id) && getAbsenceForDate(employee.id, ui.selectedDate))
+    .filter((employee) => employee.isActive && !assignedEmployeeIds.has(employee.id) && (replacedEmployeeIds.has(employee.id) || getAbsenceForDate(employee.id, ui.selectedDate)))
     .map((employee) => employee.id));
   const availableCount = Math.max(0, activeEmployeeIds.size - assignedEmployeeIds.size - absentEmployeeIds.size);
   return `
@@ -743,7 +773,7 @@ function renderRosterView() {
     </div>
 
     <div class="roster-summary" aria-label="Сводка по раскладке">
-      <div><strong>${assignedEmployeeIds.size}</strong><span>В строю</span></div>
+      <div><strong>${assignedEmployeeIds.size + substituteIds.size}</strong><span>В строю</span></div>
       <div><strong>${absentEmployeeIds.size}</strong><span>Отсутствуют</span></div>
       <div><strong>${availableCount}</strong><span>Свободны</span></div>
     </div>
@@ -794,12 +824,76 @@ function renderRosterCommentPanel(roster) {
           <h2>Комментарий</h2>
           <div class="muted small">Короткая заметка для фото раскладки</div>
         </div>
+        ${can("roster.edit") ? `<button class="ghost-btn compact-btn" data-manage-comment-templates type="button">Шаблоны</button>` : ""}
       </div>
       <div class="panel-body">
         <textarea class="field roster-comment" data-roster-comment maxlength="240" placeholder="Например: сбор в 8:30" ${can("roster.edit") ? "" : "readonly"}>${escapeHtml(roster.comment || "")}</textarea>
+        ${can("roster.edit") && state.rosterCommentTemplates?.length ? `<div class="comment-template-insert"><button class="ghost-btn" data-open-comment-template-picker type="button" aria-expanded="false" aria-controls="comment-template-picker">Выбрать готовые записи</button><div id="comment-template-picker" data-comment-template-picker hidden><div class="comment-template-choices" role="group" aria-label="Шаблоны для вставки">${state.rosterCommentTemplates.map((item) => `<label class="comment-template-choice"><input type="checkbox" data-comment-template-check value="${escapeAttr(item.id)}" /><span>${escapeHtml(item.text)}</span></label>`).join("")}</div><button class="ghost-btn" data-insert-comment-template type="button">Вставить выбранные</button></div></div>` : ""}
       </div>
     </section>
   `;
+}
+
+function renderCommentTemplateRow(item = { id: createId("comment-template"), text: "", weekday: null }) {
+  const days = [[1, "По понедельникам"], [2, "По вторникам"], [3, "По средам"], [4, "По четвергам"], [5, "По пятницам"], [6, "По субботам"], [0, "По воскресеньям"]];
+  return `<div class="comment-template-row" data-comment-template-row>
+    <input type="hidden" name="templateId" value="${escapeAttr(item.id)}" />
+    <label class="field-group">Готовая запись<textarea class="field" name="templateText" required maxlength="240" placeholder="Например: Заправка техники">${escapeHtml(item.text)}</textarea></label>
+    <label class="field-group">Автоматически добавлять<select class="field" name="templateWeekday"><option value="">Только вручную</option>${days.map(([value, label]) => `<option value="${value}" ${item.weekday === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    <button class="danger-btn compact-btn" data-remove-comment-template type="button">Удалить шаблон</button>
+  </div>`;
+}
+
+function renderCommentTemplatesModal() {
+  return `<div class="modal-backdrop"><form class="modal" data-comment-templates-form>
+    <div class="modal-head"><h2>Шаблоны комментариев</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть шаблоны">×</button></div>
+    <div class="modal-body">
+      <p class="muted small">Создайте готовые записи для вставки. Выберите день недели, чтобы запись автоматически появлялась в новой раскладке на этот день. Уже заполненные комментарии не меняются.</p>
+      <div data-comment-template-rows>${normalizeCommentTemplates(state.rosterCommentTemplates).map(renderCommentTemplateRow).join("")}</div>
+      <p class="form-error small" data-comment-templates-error role="alert" hidden></p>
+      <div class="actions"><button class="ghost-btn" data-add-comment-template type="button">+ Добавить шаблон</button><button class="ghost-btn" data-add-comment-examples type="button">Добавить примеры</button></div>
+      <div class="actions"><button class="btn" type="submit">Сохранить</button></div>
+    </div>
+  </form></div>`;
+}
+
+function bindCommentTemplatesForm() {
+  const form = document.querySelector("[data-comment-templates-form]");
+  if (!form) return;
+  const rows = form.querySelector("[data-comment-template-rows]");
+  form.querySelector("[data-add-comment-template]").addEventListener("click", () => {
+    rows.insertAdjacentHTML("beforeend", renderCommentTemplateRow());
+    rows.lastElementChild.querySelector('[name="templateText"]').focus();
+  });
+  form.querySelector("[data-add-comment-examples]").addEventListener("click", () => {
+    const existing = [...rows.querySelectorAll('[name="templateText"]')].map((field) => field.value.trim());
+    [[5, "Заправка техники"], [6, "ПХД техники"], [0, "ПХД гараж"]].forEach(([weekday, text]) => {
+      if (!existing.includes(text)) rows.insertAdjacentHTML("beforeend", renderCommentTemplateRow({ id: createId("comment-template"), text, weekday }));
+    });
+  });
+  rows.addEventListener("click", (event) => {
+    event.target.closest("[data-remove-comment-template]")?.closest("[data-comment-template-row]").remove();
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const templates = [...rows.querySelectorAll("[data-comment-template-row]")].map((row) => ({
+      id: row.querySelector('[name="templateId"]').value,
+      text: row.querySelector('[name="templateText"]').value.trim(),
+      weekday: row.querySelector('[name="templateWeekday"]').value === "" ? null : Number(row.querySelector('[name="templateWeekday"]').value)
+    }));
+    const tooLong = Array.from({ length: 7 }, (_, day) => templates.filter((item) => item.weekday === day).map((item) => item.text).join("\n").length).some((length) => length > 240);
+    if (templates.some((item) => !item.text) || tooLong) {
+      const error = form.querySelector("[data-comment-templates-error]");
+      error.textContent = tooLong ? "Все автоматические записи на один день должны помещаться в 240 символов." : "Заполните текст каждого шаблона.";
+      error.hidden = false;
+      return;
+    }
+    state.rosterCommentTemplates = templates;
+    persist();
+    ui.modal = null;
+    render();
+    showToast("Шаблоны сохранены");
+  });
 }
 
 function renderEmptyBlocksPanel() {
@@ -813,13 +907,15 @@ function renderEmptyBlocksPanel() {
 }
 
 function renderAssignmentSlot(blockId, index, employeeId) {
-  const employee = findEmployee(employeeId);
+  const substitution = getRoster().substitutions[employeeId];
+  const employee = substitution ? { shortName: substitution.name } : findEmployee(employeeId);
+  const replacement = substitution ? findEmployee(substitution.replacedEmployeeId)?.shortName || substitution.replacedName : "";
   const block = getRoster().blocks.find((item) => item.id === blockId);
   const tag = can("roster.edit") ? "button" : "div";
   return `
     <${tag} class="slot ${employee ? "" : "empty"}" ${can("roster.edit") ? `data-pick-assignment="${escapeAttr(blockId)}" data-assignment-title="${escapeAttr(block ? blockTitleForDate(block.title, ui.selectedDate) : "Блок")}" data-position="${index}" type="button"` : ""}>
       <span class="slot-index">${index + 1}</span>
-      <span class="slot-name">${employee ? escapeHtml(employee.shortName) : "+ Выбрать сотрудника"}</span>
+      <span class="slot-name">${employee ? escapeHtml(employee.shortName) : "+ Выбрать сотрудника"}${substitution ? `<small class="substitution-note">${escapeHtml(substitution.kind === "additional" ? "Дополнительно на эту смену" : replacement ? `Подмена ${replacement}` : "Подмена на эту смену")}</small>` : ""}</span>
       <span class="slot-meta">${employee && can("roster.edit") ? "Изменить" : ""}</span>
     </${tag}>
   `;
@@ -836,7 +932,7 @@ function renderOthersPanel(roster) {
       <div class="panel-head">
         <div>
           <h2>Отсутствующие</h2>
-          <div class="muted small">Укажите отгул, больничный, отпуск, командировку или подмену</div>
+          <div class="muted small">Укажите отгул, больничный, отпуск или командировку</div>
         </div>
         <span class="chip violet">${activeEmployees.length}</span>
       </div>
@@ -844,13 +940,14 @@ function renderOthersPanel(roster) {
         <div class="other-list">
           ${activeEmployees.map((employee) => {
             const absence = getAbsenceForDate(employee.id, ui.selectedDate);
+            const substitution = activeRosterSubstitutions(roster).find((person) => person.replacedEmployeeId === employee.id);
             return `
               <${can("roster.edit") ? "button" : "div"} class="other-row" ${can("roster.edit") ? `data-status-employee="${employee.id}" type="button"` : ""}>
                 <span>
                   <span class="row-title">${escapeHtml(employee.shortName)}</span>
-                  <span class="row-subtitle">${absence ? absencePeriodText(absence) : "Статус не указан"}</span>
+                  <span class="row-subtitle">${substitution ? escapeHtml(`На эту смену выходит ${substitution.name}`) : absence ? absencePeriodText(absence) : "Статус не указан"}</span>
                 </span>
-                <span class="chip ${absence ? absenceColors[absence.absenceType] : ""}">${absence ? absenceStatusLabel(absence) : "Указать"}</span>
+                <span class="chip ${substitution ? "orange" : absence ? absenceColors[absence.absenceType] : ""}">${substitution ? "Подмена" : absence ? absenceStatusLabel(absence) : "Указать"}</span>
               </${can("roster.edit") ? "button" : "div"}>
             `;
           }).join("") || `<div class="empty-state">Все активные сотрудники назначены.</div>`}
@@ -1067,9 +1164,24 @@ function renderWorkView() {
     : 0;
   return `
     <div class="page-title work-heading">
-      <div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
+      <div class="work-title-row"><div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
+    <div class="equipment-tools" role="group" aria-label="Поиск и фильтры оборудования">
+      <button class="icon-btn equipment-tool${ui.equipmentTool === "search" ? " active" : ""}" data-equipment-tool="search" data-active="${Boolean(ui.equipmentSearch)}" aria-label="Поиск оборудования" title="Поиск" aria-expanded="${ui.equipmentTool === "search"}" aria-controls="equipment-search-panel" type="button"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg></button>
+      <button class="icon-btn equipment-tool${ui.equipmentTool === "filter" ? " active" : ""}" data-equipment-tool="filter" data-active="${Boolean(ui.equipmentCondition || ui.equipmentSort !== "asc")}" aria-label="Фильтры оборудования" title="Фильтры" aria-expanded="${ui.equipmentTool === "filter"}" aria-controls="equipment-filter-panel" type="button"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 4h18l-7 8v7l-4 2V12Z"/></svg></button>
+    </div>
+    </div>
       ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>` : ""}
     </div>
+    <div id="equipment-search-panel" class="equipment-search-panel" ${ui.equipmentTool === "search" ? "" : "hidden"}>
+      <div class="field-group"><label for="equipment-search">Поиск по базе</label><input id="equipment-search" class="search" data-equipment-search type="search" placeholder="Название, номер или место хранения" value="${escapeAttr(ui.equipmentSearch)}" /></div>
+    </div>
+    <div id="equipment-filter-panel" class="equipment-filters equipment-filter-panel" ${ui.equipmentTool === "filter" ? "" : "hidden"}>
+      <div class="field-group"><label for="equipment-condition-filter">Состояние</label><select id="equipment-condition-filter" class="field" data-equipment-condition><option value="">Все состояния</option>${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${ui.equipmentCondition === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
+      <div class="field-group"><label for="equipment-sort">По названию</label><select id="equipment-sort" class="field" data-equipment-sort><option value="asc" ${ui.equipmentSort === "asc" ? "selected" : ""}>А–Я</option><option value="desc" ${ui.equipmentSort === "desc" ? "selected" : ""}>Я–А</option></select></div>
+    </div>
+    <div class="equipment-tabs" role="tablist" aria-label="Разделы оборудования">${Object.entries(equipmentGroups).map(([key, label]) => `
+      <button class="equipment-tab ${!ui.equipmentLocation && ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${!ui.equipmentLocation && ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
+    `).join("")}</div>
     <div class="equipment-location-filter">
       <label for="equipment-location-filter">Выберите машину</label>
       <select id="equipment-location-filter" class="field" data-equipment-location>
@@ -1078,17 +1190,9 @@ function renderWorkView() {
       </select>
       ${locations.length ? `<span class="muted small">Список составлен из значений поля «Место хранения».</span>` : `<span class="muted small">Заполните «Место хранения» у экземпляров оборудования, и варианты появятся здесь.</span>`}
     </div>
-    <div class="equipment-tabs" role="tablist" aria-label="Разделы оборудования">${Object.entries(equipmentGroups).map(([key, label]) => `
-      <button class="equipment-tab ${!ui.equipmentLocation && ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${!ui.equipmentLocation && ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
-    `).join("")}</div>
     <section id="equipment-group-panel" role="tabpanel" aria-labelledby="equipment-tab-${ui.equipmentGroup}">
     <div class="equipment-summary">
       <div class="panel"><span class="muted small">${ui.equipmentLocation ? `Позиций в месте хранения «${escapeHtml(ui.equipmentLocation)}»` : `Позиций в разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}»`}</span><strong>${ui.equipmentLocation ? locationCount : groupCount}</strong></div>
-    </div>
-    <div class="equipment-filters">
-      <div class="field-group"><label for="equipment-search">Поиск по базе</label><input id="equipment-search" class="search" data-equipment-search type="search" placeholder="Название, номер или место хранения" value="${escapeAttr(ui.equipmentSearch)}" /></div>
-      <div class="field-group"><label for="equipment-condition-filter">Состояние</label><select id="equipment-condition-filter" class="field" data-equipment-condition><option value="">Все состояния</option>${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${ui.equipmentCondition === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
-      <div class="field-group"><label for="equipment-sort">По названию</label><select id="equipment-sort" class="field" data-equipment-sort><option value="asc" ${ui.equipmentSort === "asc" ? "selected" : ""}>А–Я</option><option value="desc" ${ui.equipmentSort === "desc" ? "selected" : ""}>Я–А</option></select></div>
     </div>
     <div data-equipment-results>${renderEquipmentResults()}</div>
     </section>
@@ -1169,9 +1273,9 @@ function renderEquipmentResults() {
     .sort((a, b) => (ui.equipmentSort === "desc" ? -1 : 1) * a.item.name.localeCompare(b.item.name, "ru", { numeric: true, sensitivity: "base" }));
   if (!items.length) return `<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : ui.equipmentLocation ? `В месте хранения «${escapeHtml(ui.equipmentLocation)}» оборудование не найдено` : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : ui.equipmentLocation ? "Проверьте место хранения у нужного экземпляра." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
   return `
-    <p class="muted small" role="status">Найдено позиций: ${items.length}</p>
+    ${query || ui.equipmentCondition ? `<p class="muted small" role="status">Показано ${items.length} из ${groupItems.length}</p>` : ""}
     <div class="equipment-list">${items.map(({ item, instances, total, quantityOnly, condition, comment }) => {
-      const collapsed = ui.collapsedEquipmentIds.includes(item.id);
+      const collapsed = !ui.expandedEquipmentIds.includes(item.id);
       const bodyId = `equipment-card-body-${item.id}`;
       return `<article class="panel equipment-card${collapsed ? " collapsed" : ""}">
         <button class="equipment-card-toggle" data-toggle-equipment="${escapeAttr(item.id)}" type="button" aria-expanded="${!collapsed}" aria-controls="${escapeAttr(bodyId)}">
@@ -1344,7 +1448,77 @@ function bindEquipmentGroupsForm() {
   });
 }
 
+function syncEquipmentTools() {
+  document.querySelectorAll("[data-equipment-tool]").forEach((button) => {
+    const tool = button.dataset.equipmentTool;
+    const open = ui.equipmentTool === tool;
+    button.setAttribute("aria-expanded", String(open));
+    button.classList.toggle("active", open);
+    button.dataset.active = String(tool === "search" ? Boolean(ui.equipmentSearch) : Boolean(ui.equipmentCondition || ui.equipmentSort !== "asc"));
+    document.getElementById(button.getAttribute("aria-controls")).hidden = !open;
+  });
+}
+
+function bindEquipmentTabsScroll() {
+  const tabs = document.querySelector(".equipment-tabs");
+  if (!tabs) return;
+  const selected = tabs.querySelector('[aria-selected="true"]');
+  if (selected) {
+    const strip = tabs.getBoundingClientRect();
+    const item = selected.getBoundingClientRect();
+    if (item.right > strip.right) tabs.scrollLeft += item.right - strip.right + 16;
+    else if (item.left < strip.left) tabs.scrollLeft -= strip.left - item.left + 16;
+  }
+  tabs.addEventListener("wheel", (event) => {
+    if (event.ctrlKey || tabs.scrollWidth <= tabs.clientWidth) return;
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    const distance = delta * (event.deltaMode === 1 ? 24 : event.deltaMode === 2 ? tabs.clientWidth : 1);
+    const previous = tabs.scrollLeft;
+    tabs.scrollLeft += distance;
+    if (tabs.scrollLeft !== previous) event.preventDefault();
+  }, { passive: false });
+  let drag = null;
+  let suppressClick = false;
+  tabs.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "mouse" || event.button !== 0) return;
+    suppressClick = false;
+    drag = { x: event.clientX, scroll: tabs.scrollLeft, moved: false };
+  });
+  tabs.addEventListener("pointermove", (event) => {
+    if (!drag || !event.buttons) return;
+    const distance = event.clientX - drag.x;
+    if (!drag.moved && Math.abs(distance) < 6) return;
+    drag.moved = true;
+    tabs.setPointerCapture(event.pointerId);
+    tabs.classList.add("dragging");
+    tabs.scrollLeft = drag.scroll - distance;
+    event.preventDefault();
+  });
+  const finishDrag = () => {
+    if (drag?.moved) suppressClick = true;
+    drag = null;
+    tabs.classList.remove("dragging");
+  };
+  tabs.addEventListener("pointerup", finishDrag);
+  tabs.addEventListener("pointercancel", finishDrag);
+  tabs.addEventListener("lostpointercapture", finishDrag);
+  tabs.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+}
+
 function bindWorkEvents() {
+  bindEquipmentTabsScroll();
+  document.querySelectorAll("[data-equipment-tool]").forEach((button) => {
+    button.addEventListener("click", () => {
+      ui.equipmentTool = ui.equipmentTool === button.dataset.equipmentTool ? "" : button.dataset.equipmentTool;
+      syncEquipmentTools();
+      if (ui.equipmentTool === "search") document.querySelector("[data-equipment-search]").focus({ preventScroll: true });
+    });
+  });
   document.querySelector("[data-manage-equipment-groups]")?.addEventListener("click", () => {
     ui.modal = { type: "equipmentGroups" };
     render();
@@ -1353,6 +1527,7 @@ function bindWorkEvents() {
     button.addEventListener("click", () => {
       if (!ui.equipmentLocation && ui.equipmentGroup === button.dataset.equipmentGroup) return;
       ui.equipmentGroup = button.dataset.equipmentGroup;
+      ui.expandedEquipmentIds = [];
       ui.equipmentLocation = "";
       ui.equipmentSearch = "";
       ui.equipmentCondition = "";
@@ -1376,11 +1551,13 @@ function bindWorkEvents() {
   });
   document.querySelector("[data-equipment-search]")?.addEventListener("input", (event) => {
     ui.equipmentSearch = event.target.value;
+    syncEquipmentTools();
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
     saveUiState();
   });
   document.querySelector("[data-equipment-location]")?.addEventListener("change", (event) => {
     ui.equipmentLocation = event.target.value;
+    ui.expandedEquipmentIds = [];
     ui.equipmentSearch = "";
     ui.equipmentCondition = "";
     render();
@@ -1388,11 +1565,13 @@ function bindWorkEvents() {
   });
   document.querySelector("[data-equipment-condition]")?.addEventListener("change", (event) => {
     ui.equipmentCondition = event.target.value;
+    syncEquipmentTools();
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
     saveUiState();
   });
   document.querySelector("[data-equipment-sort]")?.addEventListener("change", (event) => {
     ui.equipmentSort = event.target.value;
+    syncEquipmentTools();
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
     saveUiState();
   });
@@ -1400,11 +1579,11 @@ function bindWorkEvents() {
     const toggle = event.target.closest("[data-toggle-equipment]");
     if (toggle) {
       const id = toggle.dataset.toggleEquipment;
-      ui.collapsedEquipmentIds = ui.collapsedEquipmentIds.includes(id)
-        ? ui.collapsedEquipmentIds.filter((itemId) => itemId !== id)
-        : [...ui.collapsedEquipmentIds, id];
+      ui.expandedEquipmentIds = ui.expandedEquipmentIds.includes(id)
+        ? ui.expandedEquipmentIds.filter((itemId) => itemId !== id)
+        : [...ui.expandedEquipmentIds, id];
       const body = document.getElementById(toggle.getAttribute("aria-controls"));
-      const collapsed = ui.collapsedEquipmentIds.includes(id);
+      const collapsed = !ui.expandedEquipmentIds.includes(id);
       toggle.setAttribute("aria-expanded", String(!collapsed));
       body.hidden = collapsed;
       toggle.closest(".equipment-card").classList.toggle("collapsed", collapsed);
@@ -1469,6 +1648,7 @@ function saveEquipmentFromForm(event) {
   } else state.equipment.push({ id: createId("equipment"), ...equipmentData, createdAt: now, updatedAt: now });
   if (ui.equipmentGroup !== values.group) {
     ui.equipmentGroup = values.group;
+    ui.expandedEquipmentIds = [];
     ui.equipmentSearch = "";
     ui.equipmentCondition = "";
   }
@@ -1594,6 +1774,71 @@ function renderStatsRangeSheet() {
   `;
 }
 
+function activeRosterSubstitutions(roster) {
+  return allAssignments(roster).map((item) => roster.substitutions?.[item.employeeId]).filter(Boolean);
+}
+
+function substitutionHistory() {
+  const people = new Map();
+  Object.values(state.rosters || {}).forEach((roster) => {
+    Object.values(roster.substitutions || {}).forEach((person) => {
+      if (person?.name) people.set(person.name, person);
+    });
+  });
+  return [...people.values()].sort((a, b) => a.name.localeCompare(b.name, "ru"));
+}
+
+function renderSubstitutionForm(roster, currentId) {
+  const current = roster.substitutions[currentId];
+  const replacedId = current?.replacedEmployeeId || (findEmployee(currentId) ? currentId : "");
+  return `
+    ${current ? `<button class="ghost-btn" data-open-substitution="${current.kind === "additional" ? "additional" : "substitution"}" type="button" style="width:100%;margin-top:10px">${current.kind === "additional" ? "Изменить ФИО" : "Изменить подмену"}</button>` : `
+      <button class="ghost-btn" data-open-substitution="substitution" type="button" style="width:100%;margin-top:10px">Подмена на эту смену</button>
+      <button class="ghost-btn" data-open-substitution="additional" type="button" style="width:100%;margin-top:10px">Вписать дополнительного сотрудника</button>`}
+    <form class="substitution-form" data-substitution-form hidden>
+      <input type="hidden" name="kind" value="${current?.kind === "additional" ? "additional" : "substitution"}" />
+      <p class="muted small">Человек из другого караула. Запись действует только на ${escapeHtml(formatShortDate(roster.date))}.</p>
+      <label>Кто выходит на смену
+        <input class="field" name="name" list="substitution-history" maxlength="80" placeholder="Например: Петров А. В." required value="${escapeAttr(current?.name || "")}" />
+      </label>
+      <datalist id="substitution-history">${substitutionHistory().map((person) => `<option value="${escapeAttr(person.name)}"></option>`).join("")}</datalist>
+      <label>Должность (необязательно)
+        <input class="field" name="position" maxlength="80" placeholder="Например: водитель" value="${escapeAttr(current?.position || "")}" />
+      </label>
+      <label data-replacement-field>Кого заменяет
+        <select class="field" name="replacedEmployeeId">
+          <option value="">Не указывать</option>
+          ${state.employees.filter((person) => person.isActive || person.id === replacedId).sort(compareEmployeesByName).map((person) => `<option value="${escapeAttr(person.id)}" ${person.id === replacedId ? "selected" : ""}>${escapeHtml(person.shortName)}</option>`).join("")}
+        </select>
+      </label>
+      <button class="btn" type="submit">Добавить в раскладку</button>
+    </form>`;
+}
+
+function saveRosterSubstitution(roster, blockId, position, values) {
+  if (!roster.blocks.some((block) => block.id === blockId) || !Number.isInteger(position) || position < 0) return "Место в раскладке не найдено. Откройте его заново.";
+  const name = String(values.name || "").trim();
+  const role = String(values.position || "").trim();
+  if (!name) return "Укажите фамилию человека, который выходит на смену.";
+  if (name.length > 80 || role.length > 80) return "Фамилия и должность должны быть не длиннее 80 символов.";
+  const kind = values.kind === "additional" ? "additional" : "substitution";
+  const replacedEmployeeId = kind === "additional" ? "" : String(values.replacedEmployeeId || "");
+  const replaced = findEmployee(replacedEmployeeId);
+  if (replacedEmployeeId && !replaced) return "Сотрудник, которого заменяют, не найден.";
+  const elsewhere = allAssignments(roster).filter((item) => item.assignmentType !== blockId || item.position !== position);
+  if (replacedEmployeeId && elsewhere.some((item) => item.employeeId === replacedEmployeeId || roster.substitutions[item.employeeId]?.replacedEmployeeId === replacedEmployeeId)) {
+    return "Этот сотрудник уже указан в другом месте раскладки. Добавьте подмену на его месте.";
+  }
+  const currentId = getAssignment(roster, blockId, position);
+  if (kind === "additional" && currentId && !roster.substitutions[currentId]) {
+    position = roster.blocks.find((block) => block.id === blockId).members.length;
+  }
+  const id = roster.substitutions[currentId] ? currentId : createId("substitution");
+  roster.substitutions[id] = { name, position: role, kind, replacedEmployeeId, replacedName: replaced?.shortName || "" };
+  setAssignment(roster, blockId, position, id);
+  return "";
+}
+
 function renderEmployeePickerSheet() {
   const { assignmentType, position, query = "" } = ui.sheet;
   const roster = getRoster();
@@ -1639,6 +1884,7 @@ function renderEmployeePickerSheet() {
         </div>
         <div class="sheet-body">
           <input class="search" data-picker-search placeholder="Поиск по фамилии" value="${escapeAttr(query)}" />
+          ${renderSubstitutionForm(roster, currentId)}
           ${isReservePicker ? `<p class="picker-hint">Показаны все активные водители. Доступные идут первыми, а водители с отсутствием отмечены статусом. Очередность учитывает дату последнего резерва.</p>` : ""}
           ${currentId ? `<button class="danger-btn" data-clear-assignment type="button" style="width:100%;margin-top:10px">Очистить назначение</button>` : ""}
           <div class="picker-list">
@@ -1688,7 +1934,7 @@ function renderStatusPickerSheet() {
           <div class="status-grid">
             ${choosingVacation
               ? Object.entries(vacationLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === "VACATION" && active.vacationType === key ? "active" : ""}" data-set-vacation="${key}" aria-pressed="${active?.absenceType === "VACATION" && active.vacationType === key}" type="button">${label}</button>`).join("")
-              : Object.entries(absenceLabels).map(([key, label]) => `<button class="status-btn ${active?.absenceType === key ? "active" : ""}" data-set-status="${key}" type="button">${label}${key === "VACATION" ? " ›" : ""}</button>`).join("")}
+              : Object.entries(absenceLabels).filter(([key]) => key !== "SUBSTITUTE").map(([key, label]) => `<button class="status-btn ${active?.absenceType === key ? "active" : ""}" data-set-status="${key}" type="button">${label}${key === "VACATION" ? " ›" : ""}</button>`).join("")}
           </div>
           <div class="actions status-actions">
             <button class="danger-btn" data-clear-status type="button">Очистить статус</button>
@@ -1700,6 +1946,7 @@ function renderStatusPickerSheet() {
 }
 
 function renderModal() {
+  if (ui.modal.type === "commentTemplates") return renderCommentTemplatesModal();
   if (ui.modal.type === "equipmentGroups") return renderEquipmentGroupsModal();
   if (ui.modal.type === "equipmentForm") return renderEquipmentFormModal();
   if (ui.modal.type.startsWith("access")) return renderAccessModal();
@@ -1969,6 +2216,7 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
+    if (ui.view !== button.dataset.view) ui.expandedEquipmentIds = [];
     ui.view = button.dataset.view;
     ui.sheet = null;
     ui.modal = null;
@@ -2022,6 +2270,30 @@ function bindRosterEvents() {
   }));
   document.querySelector("[data-roster-comment]")?.addEventListener("input", (event) => {
     updateRosterComment(event.target.value);
+  });
+  document.querySelector("[data-manage-comment-templates]")?.addEventListener("click", () => {
+    ui.modal = { type: "commentTemplates" };
+    render();
+  });
+  document.querySelector("[data-insert-comment-template]")?.addEventListener("click", () => {
+    const selected = [...document.querySelectorAll("[data-comment-template-check]:checked")];
+    const ids = new Set(selected.map((checkbox) => checkbox.value));
+    const templates = state.rosterCommentTemplates.filter((item) => ids.has(item.id));
+    if (!templates.length) return showToast("Отметьте записи, которые хотите вставить");
+    const current = getRoster().comment.trimEnd();
+    const text = templates.map((item) => item.text).join("\n");
+    const comment = current ? `${current}\n${text}` : text;
+    if (comment.length > 240) return showToast("Комментарий не должен превышать 240 символов. Сократите текст перед вставкой.");
+    updateRosterComment(comment);
+    document.querySelector("[data-roster-comment]").value = comment;
+    selected.forEach((checkbox) => { checkbox.checked = false; });
+    document.querySelector("[data-comment-template-picker]").hidden = true;
+    document.querySelector("[data-open-comment-template-picker]").setAttribute("aria-expanded", "false");
+  });
+  document.querySelector("[data-open-comment-template-picker]")?.addEventListener("click", (event) => {
+    const picker = document.querySelector("[data-comment-template-picker]");
+    picker.hidden = !picker.hidden;
+    event.currentTarget.setAttribute("aria-expanded", String(!picker.hidden));
   });
   document.querySelectorAll("[data-status-employee]").forEach((button) => button.addEventListener("click", () => {
     ui.sheet = { type: "statusPicker", employeeId: button.dataset.statusEmployee };
@@ -2211,6 +2483,31 @@ function bindAccessModalEvents() {
 }
 
 function bindSheetEvents() {
+  document.querySelectorAll("[data-open-substitution]").forEach((button) => button.addEventListener("click", () => {
+    const form = document.querySelector("[data-substitution-form]");
+    const kind = button.dataset.openSubstitution;
+    form.hidden = !form.hidden && form.elements.kind.value === kind;
+    form.elements.kind.value = kind;
+    const replacementField = form.querySelector("[data-replacement-field]");
+    replacementField.hidden = kind === "additional";
+    form.elements.replacedEmployeeId.disabled = kind === "additional";
+    if (!form.hidden) form.querySelector('[name="name"]').focus();
+  }));
+  document.querySelector("[data-substitution-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!can("roster.edit")) return;
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const { assignmentType, position } = ui.sheet;
+    let error;
+    updateRoster((roster) => { error = saveRosterSubstitution(roster, assignmentType, position, values); });
+    if (error) return showToast(error);
+    ui.sheet = null;
+    render();
+  });
+  document.querySelector('[data-substitution-form] [name="name"]')?.addEventListener("change", (event) => {
+    const previous = substitutionHistory().find((person) => person.name === event.target.value.trim());
+    if (previous) document.querySelector('[data-substitution-form] [name="position"]').value = previous.position || "";
+  });
   document.querySelectorAll("[data-close-sheet]").forEach((node) => node.addEventListener("click", () => {
     ui.sheet = null;
     render();
@@ -2304,6 +2601,7 @@ function bindModalEvents() {
   bindAccessModalEvents();
   bindEquipmentInstances();
   bindEquipmentGroupsForm();
+  bindCommentTemplatesForm();
   document.querySelector("[data-delete-equipment]")?.addEventListener("click", (event) => deleteEquipment(event.currentTarget.dataset.deleteEquipment));
   bindVacationPeriods();
   document.querySelector("[data-delete-employee]")?.addEventListener("click", (event) => {
@@ -2362,10 +2660,10 @@ function clearAbsenceStatus(employeeId, date) {
 
 function updateRoster(mutator) {
   const roster = getRoster();
-  const before = JSON.stringify({ blocks: roster.blocks, comment: roster.comment });
+  const before = JSON.stringify({ blocks: roster.blocks, comment: roster.comment, substitutions: roster.substitutions });
   mutator(roster);
   normalizeRoster(roster);
-  const after = JSON.stringify({ blocks: roster.blocks, comment: roster.comment });
+  const after = JSON.stringify({ blocks: roster.blocks, comment: roster.comment, substitutions: roster.substitutions });
   if (before !== after) {
     roster.updatedAt = new Date().toISOString();
   }
@@ -2447,6 +2745,11 @@ function saveTitleFromForm(event) {
 
 function rosterData(roster) {
   const personData = (id) => {
+    const substitution = roster.substitutions?.[id];
+    if (substitution) {
+      const replacedName = findEmployee(substitution.replacedEmployeeId)?.shortName || substitution.replacedName;
+      return { name: substitution.kind === "additional" ? substitution.name : `${substitution.name} — ${replacedName ? `подмена ${replacedName}` : "подмена на эту смену"}`, position: substitution.position || "", lastName: substitution.name, isAdditional: substitution.kind === "additional" };
+    }
     const employee = findEmployee(id);
     return employee ? { name: employee.shortName, position: employee.position || "", additionalProfession: employee.additionalProfession || "", lastName: employee.lastName || "" } : null;
   };
@@ -2471,6 +2774,9 @@ function rosterData(roster) {
     date: roster.date,
     dateText: formatLongDate(roster.date),
     comment: roster.comment || "",
+    commentTemplateLines: state.rosterCommentTemplates
+      .filter((template) => (`\n${String(roster.comment || "").trim()}\n`).includes(`\n${template.text.trim()}\n`))
+      .flatMap((template) => template.text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)),
     blocks: roster.blocks
       .map((block) => ({
         title: blockTitleForDate(block.title, roster.date),
@@ -2529,7 +2835,8 @@ function generateClientPng(data) {
       type: "comment",
       title: "КОММЕНТАРИЙ",
       color: "#ffd36e",
-      text: comment
+      text: comment,
+      templateLines: data.commentTemplateLines
     });
   }
   const canvas = document.createElement("canvas");
@@ -2596,7 +2903,7 @@ function generateClientPng(data) {
     if (section.type === "people") {
       drawPeopleSection(ctx, section.title, section.people, sectionX, sectionY, section.color, width);
     } else if (section.type === "comment") {
-      drawCommentSection(ctx, section.title, section.text, sectionX, sectionY, section.color, width);
+      drawCommentSection(ctx, section.title, section.text, sectionX, sectionY, section.color, width, section.templateLines);
     } else {
       drawRowsSection(ctx, section.title, section.rows, sectionX, sectionY, section.color, width);
     }
@@ -2615,9 +2922,8 @@ function measureCanvasSection(ctx, section, width = 908) {
     }, 0) + 36;
   }
   if (section.type === "comment") {
-    ctx.font = "700 32px Arial, sans-serif";
-    const lines = wrapCanvasLines(ctx, section.text || "", width - 28);
-    return headerHeight + lines.length * 42 + 52;
+    return headerHeight + canvasCommentEntries(ctx, section.text, section.templateLines, width)
+      .reduce((height, entry) => height + entry.lines.length * 42 + (entry.highlighted ? 24 : 0), 0) + 52;
   }
   return headerHeight + section.rows.reduce((sum, [label, value, position, vacationPeriod]) => {
     ctx.font = "800 34px Arial, sans-serif";
@@ -2742,15 +3048,30 @@ function drawRowsSection(ctx, title, rows, x, y, color, width = 908) {
   return y + 34;
 }
 
-function drawCommentSection(ctx, title, text, x, y, color, width = 908) {
+function canvasCommentEntries(ctx, text, templateLines, width) {
+  const highlightedLines = new Set(Array.isArray(templateLines) ? templateLines : []);
+  return String(text || "").split(/\r?\n/).map((line) => {
+    const highlighted = Boolean(line.trim()) && highlightedLines.has(line.trim());
+    ctx.font = `${highlighted ? 900 : 700} 32px Arial, sans-serif`;
+    return { highlighted, lines: wrapCanvasLines(ctx, line, width - 28) };
+  });
+}
+
+function drawCommentSection(ctx, title, text, x, y, color, width = 908, templateLines = []) {
   const top = y;
-  const height = measureCanvasSection(ctx, { type: "comment", title, text }, width);
+  const height = measureCanvasSection(ctx, { type: "comment", title, text, templateLines }, width);
   drawCanvasPanel(ctx, x, top, width, height);
   y = drawSectionHeader(ctx, title, x, y, color, width);
-  ctx.fillStyle = "#fff8ef";
-  ctx.font = "700 32px Arial, sans-serif";
-  wrapCanvasLines(ctx, text || "", width - 28).forEach((line, index) => {
-    ctx.fillText(line, x, y + index * 42);
+  canvasCommentEntries(ctx, text, templateLines, width).forEach((entry) => {
+    if (entry.highlighted) {
+      ctx.fillStyle = "rgba(255, 211, 110, .16)";
+      fillCanvasRoundRect(ctx, x, y - 6, width, entry.lines.length * 42 + 16, 8);
+      y += 6;
+    }
+    ctx.fillStyle = entry.highlighted ? "#ffe3a0" : "#fff8ef";
+    ctx.font = `${entry.highlighted ? 900 : 700} 32px Arial, sans-serif`;
+    entry.lines.forEach((line, index) => ctx.fillText(line, x + (entry.highlighted ? 14 : 0), y + index * 42));
+    y += entry.lines.length * 42 + (entry.highlighted ? 18 : 0);
   });
   return top + height;
 }
@@ -3108,6 +3429,8 @@ function isDriverPosition(position) {
 }
 
 function comparePeopleForRosterCard(a, b) {
+  const additionalDiff = Number(a.isAdditional === true) - Number(b.isAdditional === true);
+  if (additionalDiff) return additionalDiff;
   const rtpDiff = Number(hasRtpProfession(b.additionalProfession)) - Number(hasRtpProfession(a.additionalProfession));
   if (rtpDiff) return rtpDiff;
   const driverDiff = Number(isDriverPosition(a.position)) - Number(isDriverPosition(b.position));

@@ -1,4 +1,4 @@
-const CACHE = "caraul-v81";
+const CACHE = "caraul-v95";
 const ASSETS = ["/", "/index.html", "/styles.css", "/redesign.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

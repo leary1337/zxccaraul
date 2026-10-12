@@ -282,6 +282,8 @@ function isDriverPosition(position) {
 }
 
 function compareRosterPeople(a, b) {
+  const additionalDiff = Number(a?.isAdditional === true) - Number(b?.isAdditional === true);
+  if (additionalDiff) return additionalDiff;
   const rtpDiff = Number(hasRtpProfession(b?.additionalProfession)) - Number(hasRtpProfession(a?.additionalProfession));
   if (rtpDiff) return rtpDiff;
   const driverDiff = Number(isDriverPosition(personPosition(a))) - Number(isDriverPosition(personPosition(b)));
@@ -478,7 +480,9 @@ function compareAbsentItems(a, b) {
 }
 
 function sectionHeight(section) {
-  if (section.kind === "comment") return 170 + Math.ceil(String(section.text || "").length / 42) * 42;
+  if (section.kind === "comment") return 170 + String(section.text || "").split(/\r?\n/)
+    .reduce((height, line) => height + Math.max(1, Math.ceil(line.length / 38)) * 42
+      + (line.trim() && section.templateLines.includes(line.trim()) ? 32 : 0), 0);
   return 118 + Math.max(1, section.kind === "absent" ? section.items.length : section.people.length) * (section.kind === "absent" ? 82 : 76)
     + (section.kind === "absent" ? section.items.filter((item) => item.absenceType === "VACATION" && item.vacationPeriod).length * 34 : 0);
 }
@@ -499,7 +503,10 @@ function renderSection(section) {
     return `
       <section class="tone-${section.tone} comment-section">
         <h2>Комментарий</h2>
-        <p>${escapeHtml(section.text)}</p>
+        ${String(section.text).split(/\r?\n/).map((line) => {
+          const highlighted = Boolean(line.trim()) && section.templateLines.includes(line.trim());
+          return `<p${highlighted ? ' class="template-comment"' : ''}>${escapeHtml(line) || "&nbsp;"}</p>`;
+        }).join("")}
       </section>
     `;
   }
@@ -544,7 +551,7 @@ function renderDutyRosterVkCard(data) {
   const sections = [
     ...blocks.map((block, index) => ({ kind: "people", title: block.title, people: block.people, tone: index % 4 })),
     ...(absent.length ? [{ kind: "absent", items: absent, tone: blocks.length % 4 }] : []),
-    ...(comment ? [{ kind: "comment", text: comment, tone: (blocks.length + (absent.length ? 1 : 0)) % 4 }] : [])
+    ...(comment ? [{ kind: "comment", text: comment, templateLines: Array.isArray(data.commentTemplateLines) ? data.commentTemplateLines : [], tone: (blocks.length + (absent.length ? 1 : 0)) % 4 }] : [])
   ];
   const { columns, heights } = distributeSections(sections);
   const cardHeight = Math.max(620, 280 + Math.max(...heights, 0));
@@ -794,6 +801,14 @@ function renderDutyRosterVkCard(data) {
       font-weight: 700;
       overflow-wrap: anywhere;
       white-space: pre-wrap;
+    }
+    .comment-section .template-comment {
+      margin: 6px 0;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: rgba(255, 211, 110, .16);
+      color: #ffe3a0;
+      font-weight: 900;
     }
   </style>
 </head>
@@ -1066,12 +1081,14 @@ function projectAppState(value, context) {
     equipmentGroups: {},
     absences: [],
     templateBlocks: [],
+    rosterCommentTemplates: [],
     rosters: {}
   };
   if (["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.employees = value.employees || [];
   if (["roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.absences = value.absences || [];
   if (hasPermission(context, "roster.view")) {
     projected.templateBlocks = value.templateBlocks || [];
+    projected.rosterCommentTemplates = value.rosterCommentTemplates || [];
     projected.rosters = value.rosters || {};
   }
   if (hasPermission(context, "work.view")) {
@@ -1092,7 +1109,7 @@ function mergeAuthorizedState(previousValue, submittedValue, context) {
     { keys: ["employees"], edit: "employees.edit", view: ["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission)) },
     { keys: ["equipment", "equipmentGroups", "equipmentGroupsConfigured"], edit: "work.edit", view: hasPermission(context, "work.view") },
     { keys: ["absences"], edit: "roster.edit", view: hasPermission(context, "roster.view") || hasPermission(context, "stats.view") },
-    { keys: ["templateBlocks", "rosters"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
+    { keys: ["templateBlocks", "rosters", "rosterCommentTemplates"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
   ];
   for (const section of sections) {
     for (const key of section.keys) {

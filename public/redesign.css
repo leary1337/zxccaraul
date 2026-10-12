@@ -481,10 +481,15 @@ textarea.field {
   margin: 0 -16px 16px;
   padding: 0 16px 3px;
   overflow-x: auto;
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  cursor: grab;
+  user-select: none;
 }
 
-.equipment-tabs::-webkit-scrollbar { display: none; }
+.equipment-tabs::-webkit-scrollbar { height: 6px; }
+.equipment-tabs::-webkit-scrollbar-thumb { background: #424957; border-radius: 999px; }
+.equipment-tabs.dragging,
+.equipment-tabs.dragging .equipment-tab { cursor: grabbing; }
 
 .equipment-tab {
   flex: 0 0 auto;
@@ -537,6 +542,132 @@ textarea.field {
 
 .equipment-filters .field-group:first-child {
   grid-column: 1 / -1;
+}
+
+.equipment-tools {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.comment-template-insert {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.comment-template-choices {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.comment-template-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 4px;
+  cursor: pointer;
+}
+
+.comment-template-choice input {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.comment-template-choice span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.comment-template-row {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.comment-template-row .field-group {
+  margin: 0;
+}
+
+.comment-template-row > button {
+  justify-self: start;
+}
+
+.work-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.work-title-row > div:first-child {
+  min-width: 0;
+}
+
+.work-title-row .equipment-tools {
+  flex-shrink: 0;
+  margin-bottom: 0;
+}
+
+.equipment-tool {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  color: var(--muted);
+}
+
+.equipment-tool.active {
+  border-color: var(--primary);
+  color: #ff9b87;
+  background: rgba(255, 90, 61, .14);
+}
+
+.equipment-tool[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+
+.equipment-search-panel {
+  margin-bottom: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.equipment-search-panel .field-group {
+  margin-bottom: 0;
+}
+
+.equipment-filters.equipment-filter-panel {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.equipment-filter-panel .field-group:first-child {
+  grid-column: auto;
+}
+
+.equipment-filter-panel[hidden],
+.equipment-search-panel[hidden] {
+  display: none;
 }
 
 .equipment-card {
@@ -931,3 +1062,9 @@ textarea.field {
     grid-column: 1 / -1;
   }
 }
+/* Temporary replacements belong to a single roster date. */
+.substitution-note { display: block; margin-top: 4px; font-size: 12px; color: #ffd36e; }
+.substitution-form { display: grid; gap: 12px; margin-top: 12px; padding: 14px; border: 1px solid var(--border, #303743); border-radius: 14px; }
+.substitution-form[hidden] { display: none; }
+.substitution-form [hidden] { display: none; }
+.substitution-form label { display: grid; gap: 6px; }
