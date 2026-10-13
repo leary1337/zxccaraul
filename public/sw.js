@@ -1,5 +1,5 @@
-const CACHE = "caraul-v95";
-const ASSETS = ["/", "/index.html", "/styles.css", "/redesign.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "caraul-v104";
+const ASSETS = ["/", "/index.html", "/styles.css", "/redesign.css", "/app.js", "/state-sync.js", "/equipment-name-match.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));

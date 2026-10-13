@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { mergeSharedState, sameState } from "./public/state-sync.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -207,6 +208,8 @@ async function loadAuthStore() {
   }
 }
 
+let authFileWriteQueue = Promise.resolve();
+
 async function persistAuthStore() {
   if (pool) {
     await pool.query(`
@@ -216,10 +219,14 @@ async function persistAuthStore() {
     `, [JSON.stringify(authStore)]);
     return;
   }
-  await mkdir(path.dirname(authStoreFile), { recursive: true });
-  const temporaryFile = `${authStoreFile}.${process.pid}.tmp`;
-  await writeFile(temporaryFile, JSON.stringify(authStore, null, 2), { mode: 0o600 });
-  await rename(temporaryFile, authStoreFile);
+  const operation = authFileWriteQueue.then(async () => {
+    await mkdir(path.dirname(authStoreFile), { recursive: true });
+    const temporaryFile = `${authStoreFile}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    await writeFile(temporaryFile, JSON.stringify(authStore, null, 2), { mode: 0o600 });
+    await rename(temporaryFile, authStoreFile);
+  });
+  authFileWriteQueue = operation.catch(() => {});
+  await operation;
 }
 
 function readBody(req) {
@@ -1072,6 +1079,25 @@ async function handleAccountApi(req, res, url, payload) {
   return false;
 }
 
+function equipmentLocationCatalog(value) {
+  const locations = new Map();
+  const ids = new Set();
+  const add = (input, id, inventoryNumber = "") => {
+    const name = String(input || "").trim().replace(/\s+/g, " ");
+    const key = name.toLocaleLowerCase("ru");
+    if (!name || locations.has(key)) return;
+    const locationId = typeof id === "string" && id && !ids.has(id) ? id : `location-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+    ids.add(locationId);
+    locations.set(key, { id: locationId, name, inventoryNumber: String(inventoryNumber || "").trim() });
+  };
+  (Array.isArray(value.equipmentLocations) ? value.equipmentLocations : []).forEach((item) => add(item?.name, item?.id, item?.inventoryNumber));
+  (Array.isArray(value.equipment) ? value.equipment : []).forEach((item) => {
+    const records = item.trackingMode === "quantity" || !Array.isArray(item.instances) || !item.instances.length ? [item] : item.instances;
+    records.forEach((record) => add(record.location));
+  });
+  return [...locations.values()];
+}
+
 function projectAppState(value, context) {
   if (!value || typeof value !== "object") return null;
   const projected = {
@@ -1079,6 +1105,7 @@ function projectAppState(value, context) {
     employees: [],
     equipment: [],
     equipmentGroups: {},
+    equipmentLocations: [],
     absences: [],
     templateBlocks: [],
     rosterCommentTemplates: [],
@@ -1094,6 +1121,7 @@ function projectAppState(value, context) {
   if (hasPermission(context, "work.view")) {
     projected.equipment = value.equipment || [];
     projected.equipmentGroups = value.equipmentGroups || {};
+    projected.equipmentLocations = equipmentLocationCatalog(value);
     if (Object.hasOwn(value, "equipmentGroupsConfigured")) projected.equipmentGroupsConfigured = value.equipmentGroupsConfigured;
   }
   return projected;
@@ -1107,7 +1135,7 @@ function mergeAuthorizedState(previousValue, submittedValue, context) {
   const sections = [
     { keys: ["appTitle"], edit: "guard.manage", view: true },
     { keys: ["employees"], edit: "employees.edit", view: ["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission)) },
-    { keys: ["equipment", "equipmentGroups", "equipmentGroupsConfigured"], edit: "work.edit", view: hasPermission(context, "work.view") },
+    { keys: ["equipment", "equipmentGroups", "equipmentGroupsConfigured", "equipmentLocations"], edit: "work.edit", view: hasPermission(context, "work.view") },
     { keys: ["absences"], edit: "roster.edit", view: hasPermission(context, "roster.view") || hasPermission(context, "stats.view") },
     { keys: ["templateBlocks", "rosters", "rosterCommentTemplates"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
   ];
@@ -1115,12 +1143,85 @@ function mergeAuthorizedState(previousValue, submittedValue, context) {
     for (const key of section.keys) {
       if (hasPermission(context, section.edit)) {
         if (Object.hasOwn(submitted, key)) merged[key] = submitted[key];
-      } else if (section.view && JSON.stringify(submitted[key]) !== JSON.stringify(visiblePrevious[key])) {
+      } else if (section.view && !(key === "equipmentGroups" ? sameState(Object.entries(submitted[key] || {}), Object.entries(visiblePrevious[key] || {})) : sameState(submitted[key], visiblePrevious[key]))) {
         return { error: `Недостаточно прав: ${permissionCatalog[section.edit]}` };
       }
     }
   }
+  if (hasPermission(context, "work.edit") && (Object.hasOwn(submitted, "equipment") || Object.hasOwn(submitted, "equipmentLocations"))) {
+    const locations = Object.hasOwn(submitted, "equipmentLocations") ? submitted.equipmentLocations : equipmentLocationCatalog(previous);
+    if (!Array.isArray(locations)) return { error: "Список мест хранения должен быть списком." };
+    const keys = new Set();
+    const ids = new Set();
+    for (const location of locations) {
+      const name = String(location?.name || "").trim().replace(/\s+/g, " ");
+      const key = name.toLocaleLowerCase("ru");
+      if (!name || name.length > 160 || String(location?.inventoryNumber || "").trim().length > 100 || typeof location?.id !== "string" || !location.id || keys.has(key) || ids.has(location.id)) {
+        return { error: "Места хранения должны иметь заполненные и неповторяющиеся названия." };
+      }
+      keys.add(key);
+      ids.add(location.id);
+    }
+    for (const item of Array.isArray(merged.equipment) ? merged.equipment : []) {
+      if (item.aliases !== undefined && (!Array.isArray(item.aliases) || item.aliases.length > 32 || item.aliases.some((name) => typeof name !== "string" || !name.trim() || name.length > 160))) {
+        return { error: "Укажите до 32 других названий оборудования, каждое не длиннее 160 символов." };
+      }
+      const records = item.trackingMode === "quantity" || !Array.isArray(item.instances) || !item.instances.length ? [item] : item.instances;
+      if (records.some((record) => record.location && !keys.has(String(record.location).trim().replace(/\s+/g, " ").toLocaleLowerCase("ru")))) {
+        return { error: "Выберите место хранения из общего списка караула." };
+      }
+    }
+    merged.equipmentLocations = locations;
+  }
   return { state: merged };
+}
+
+let stateWriteQueue = Promise.resolve();
+
+function prepareSharedUpdate(previous, payload, context) {
+  const visible = projectAppState(previous, context);
+  if (!Object.hasOwn(payload, "baseState")) return { status: 409, error: "Обновите страницу перед сохранением: включена защита от перезаписи.", code: "reload_required", state: visible };
+  if (payload.baseState !== null && (typeof payload.baseState !== "object" || Array.isArray(payload.baseState))) return { status: 400, error: "Не удалось проверить исходную версию данных." };
+  const base = payload.baseState || {};
+  const authorized = mergeAuthorizedState(base, payload.state || {}, context);
+  if (authorized.error) return { status: 403, error: authorized.error };
+  const merged = mergeSharedState(base, authorized.state, visible || {});
+  if (merged.conflicts.length) return { status: 409, code: "edit_conflict", error: "Эти записи уже изменил другой участник. Выберите, какой вариант оставить.", state: visible, conflicts: merged.conflicts };
+  const final = mergeAuthorizedState(previous, merged.state, context);
+  if (final.error) {
+    // Related records can conflict even when their IDs differ (e.g. deleting a used location).
+    const conflicts = ["equipment", "equipmentLocations", "equipmentGroups"].map((field) => ({ key: JSON.stringify([field]), path: [field], label: field === "equipment" ? "Оборудование" : field === "equipmentLocations" ? "Места хранения" : "Разделы оборудования", base: base[field], local: merged.state[field], remote: visible?.[field] }));
+    return { status: 409, code: "edit_conflict", error: final.error, state: visible, conflicts };
+  }
+  return { data: final.state };
+}
+
+async function saveSharedAppState(guardId, payload, context) {
+  if (!pool) {
+    const operation = stateWriteQueue.then(async () => {
+      const prepared = prepareSharedUpdate(await readAppState(guardId), payload, context);
+      if (prepared.status) return prepared;
+      const savedAt = await saveAppState(guardId, prepared.data);
+      return { ok: true, savedAt, state: projectAppState(prepared.data, context) };
+    });
+    stateWriteQueue = operation.catch(() => {});
+    return operation;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [guardId]);
+    const current = await client.query("select data from app_state where id = $1", [guardId]);
+    const prepared = prepareSharedUpdate(current.rows[0]?.data || null, payload, context);
+    if (prepared.status) { await client.query("ROLLBACK"); return prepared; }
+    const saved = await client.query(`insert into app_state (id, data, updated_at) values ($1, $2::jsonb, now())
+      on conflict (id) do update set data = excluded.data, updated_at = now() returning updated_at`, [guardId, JSON.stringify(prepared.data)]);
+    await client.query("COMMIT");
+    return { ok: true, savedAt: saved.rows[0]?.updated_at, state: projectAppState(prepared.data, context) };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally { client.release(); }
 }
 
 async function handleApi(req, res) {
@@ -1140,12 +1241,8 @@ async function handleApi(req, res) {
       }
 
       if (req.method === "PUT" || req.method === "POST") {
-        const nextState = payload.state || payload;
-        const previousState = await readAppState(active.context.guard.id);
-        const merged = mergeAuthorizedState(previousState, nextState, active.context);
-        if (merged.error) return sendJson(res, 403, { error: merged.error });
-        const savedAt = await saveAppState(active.context.guard.id, merged.state);
-        sendJson(res, 200, { ok: true, savedAt });
+        const result = await saveSharedAppState(active.context.guard.id, payload, active.context);
+        sendJson(res, result.status || 200, result);
         return;
       }
 

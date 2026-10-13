@@ -1,3 +1,6 @@
+import { mergeSharedState, sameState } from "./state-sync.js";
+import { findEquipmentNameMatches, parseEquipmentAliases } from "./equipment-name-match.js";
+
 const STORAGE_KEY = "caraul-state-v2";
 const LEGACY_MIGRATION_KEY = "caraul-state-server-migrated-v1";
 const UI_STORAGE_KEY = "caraul-ui-v1";
@@ -125,6 +128,15 @@ let state = blankState();
 let equipmentGroups = state.equipmentGroups;
 let remoteStateLoaded = false;
 let persistTimer = 0;
+let syncBase = null;
+let syncSaving = false;
+let syncPolling = false;
+let syncConflict = null;
+let syncError = "";
+let syncNeedsRender = false;
+let syncGeneration = 0;
+let syncDirty = false;
+let syncEditVersion = 0;
 let ui = {
   view: "roster",
   selectedDate: isoDate(addDays(new Date(), 1)),
@@ -148,6 +160,8 @@ let ui = {
   equipmentGroup: "",
   equipmentLocation: "",
   expandedEquipmentIds: [],
+  equipmentSelectionMode: false,
+  selectedEquipmentIds: [],
   accessExpandedMemberId: "",
   accessExpandedRoleId: "",
   sending: false,
@@ -222,6 +236,7 @@ function blankState() {
     equipment: [],
     equipmentGroups: {},
     equipmentGroupsConfigured: true,
+    equipmentLocations: [],
     absences: [],
     templateBlocks: [],
     rosterCommentTemplates: [],
@@ -262,6 +277,7 @@ function normalizeState(nextState) {
     }
   }
   nextState.equipmentGroups = groups;
+  normalizeEquipmentLocations(nextState);
   nextState.appTitle = String(nextState.appTitle || "Караул").trim() || "Караул";
   nextState.employees = nextState.employees.map((employee) => ({
     position: "",
@@ -326,11 +342,16 @@ function normalizeRoster(roster) {
 function persist() {
   if (!auth.session?.guard) return;
   if (!remoteStateLoaded) return;
+  syncDirty = true;
+  syncEditVersion += 1;
+  rememberStateDraft();
+  updateSyncNotice();
   window.clearTimeout(persistTimer);
   persistTimer = window.setTimeout(saveStateToServer, 450);
 }
 
 async function loadStateFromServer() {
+  const generation = syncGeneration;
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (response.status === 401) {
@@ -342,9 +363,16 @@ async function loadStateFromServer() {
     }
     if (!response.ok) throw new Error("state api unavailable");
     const result = await response.json();
+    if (generation !== syncGeneration) return;
+    syncBase = copyState(result.state);
+    syncConflict = null;
+    syncError = "";
+    syncDirty = false;
     remoteStateLoaded = true;
     if (Array.isArray(result.state?.employees)) {
       state = normalizeState(result.state);
+      syncBase = copyState(state);
+      restoreStateDraft();
       equipmentGroups = state.equipmentGroups;
       ui.expandedEquipmentIds = [];
       if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = Object.keys(equipmentGroups)[0] || "";
@@ -354,35 +382,154 @@ async function loadStateFromServer() {
       }
       normalizeStatsDates();
       render();
+      if (!syncDirty && !syncConflict) syncBase = copyState(state);
     } else {
+      restoreStateDraft();
       persist();
       render();
     }
   } catch {
+    if (generation !== syncGeneration) return;
     remoteStateLoaded = false;
     render();
   }
 }
 
 async function saveStateToServer(keepalive = false) {
+  if (!remoteStateLoaded || !auth.session?.guard || syncSaving || syncConflict) return;
+  if (!syncDirty) return;
+  const generation = syncGeneration;
+  const editVersion = syncEditVersion;
+  const sent = copyState(state);
+  const base = copyState(syncBase);
+  const editable = { appTitle: "guard.manage", employees: "employees.edit", equipment: "work.edit", equipmentGroups: "work.edit", equipmentGroupsConfigured: "work.edit", equipmentLocations: "work.edit", absences: "roster.edit", rosters: "roster.edit", templateBlocks: "roster.edit", rosterCommentTemplates: "roster.edit" };
+  for (const [field, permission] of Object.entries(editable)) if (!can(permission)) {
+    if (base && Object.hasOwn(base, field)) sent[field] = copyState(base[field]);
+    else delete sent[field];
+  }
+  syncSaving = true;
+  syncError = "";
+  rememberStateDraft();
+  updateSyncNotice();
   try {
     const response = await fetch("/api/state", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       keepalive,
-      body: JSON.stringify({ state })
+      body: JSON.stringify({ state: sent, baseState: base })
     });
+    const result = await response.json().catch(() => ({}));
+    if (generation !== syncGeneration) return;
     if (!response.ok) {
-      const result = await response.json().catch(() => ({}));
-      if (response.status === 401) await initializeAuth();
-      else showToast(result.error || "Не удалось сохранить изменения");
-    } else if (auth.session?.canImportLegacy) {
-      localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
-      localStorage.removeItem(STORAGE_KEY);
+      if (response.status === 401) { syncError = "Нужно войти снова. Ваша копия изменений сохранена в этом браузере."; remoteStateLoaded = false; }
+      else if (response.status === 409 && result.code === "edit_conflict") {
+        syncConflict = { base, remote: result.state, conflicts: result.conflicts };
+      } else syncError = result.error || "Не удалось сохранить изменения. Ваша копия остаётся в этом браузере.";
+    } else {
+      // Keep an open form's original baseline: its unsaved fields must not overwrite new remote data.
+      syncBase = sent;
+      syncDirty = syncEditVersion !== editVersion;
+      if (!syncDirty && !syncEditorOpen()) {
+        state = normalizeState(copyState(result.state));
+        syncBase = copyState(state);
+        equipmentGroups = state.equipmentGroups;
+        syncNeedsRender = true;
+      }
+      if (auth.session?.canImportLegacy) {
+        localStorage.setItem(LEGACY_MIGRATION_KEY, "done");
+        localStorage.removeItem(STORAGE_KEY);
+      }
     }
   } catch {
-    // Local storage remains the offline fallback if the database is unavailable.
+    if (generation === syncGeneration) syncError = "Нет связи с сервером. Изменения сохранены в этом браузере; попробуем отправить их снова.";
+  } finally {
+    if (generation === syncGeneration) {
+      syncSaving = false;
+      rememberStateDraft();
+      updateSyncNotice();
+      if (syncNeedsRender && !syncEditorOpen() && !syncConflict) { syncNeedsRender = false; render(); if (!syncDirty) syncBase = copyState(state); }
+      if (!syncConflict && !syncError && syncDirty) window.setTimeout(saveStateToServer, 450);
+    }
   }
+}
+
+function copyState(value) {
+  return value == null ? null : JSON.parse(JSON.stringify(value));
+}
+
+function stateDraftKey() {
+  return `caraul-draft-${auth.session?.user?.id}-${auth.session?.guard?.id}`;
+}
+
+function rememberStateDraft() {
+  if (!auth.session?.guard || !remoteStateLoaded) return;
+  try {
+    if (!syncConflict && !syncDirty) localStorage.removeItem(stateDraftKey());
+    else localStorage.setItem(stateDraftKey(), JSON.stringify({ base: syncBase, state, conflict: syncConflict }));
+  } catch { syncError = "Не удалось сохранить резервную копию в браузере. Скачайте копию изменений перед закрытием страницы."; }
+}
+
+function restoreStateDraft() {
+  try {
+    const draft = JSON.parse(localStorage.getItem(stateDraftKey()) || "null");
+    if (!draft?.state || !Object.hasOwn(draft, "base")) return;
+    const merged = mergeSharedState(draft.base, draft.state, syncBase);
+    if (merged.conflicts.length || draft.conflict) {
+      syncDirty = true;
+      syncConflict = { base: draft.base, remote: copyState(syncBase), conflicts: [...new Map([...(draft.conflict?.conflicts || []), ...merged.conflicts].map((item) => [item.key, item])).values()] };
+      syncBase = draft.base;
+      state = normalizeState(draft.state);
+    } else {
+      state = normalizeState(merged.state);
+      if (!sameState(state, syncBase)) persist();
+    }
+  } catch { syncError = "Не удалось прочитать сохранённую копию изменений в браузере."; }
+}
+
+function syncEditorOpen() {
+  return Boolean(ui.modal || ui.sheet || ui.equipmentSelectionMode || document.activeElement?.matches("input, textarea, select, [contenteditable='true']"));
+}
+
+function renderSyncNotice() {
+  if (syncConflict) return `<span>Другой участник изменил ту же запись. Ваша версия сохранена отдельно.</span><button class="ghost-btn compact-btn" data-review-sync ${ui.modal || ui.sheet ? "disabled" : ""} type="button">Сравнить варианты</button><button class="ghost-btn compact-btn" data-download-draft type="button">Скачать копию</button>`;
+  if (syncError) return `<span>${escapeHtml(syncError)}</span><button class="ghost-btn compact-btn" data-retry-sync type="button">Повторить сохранение</button><button class="ghost-btn compact-btn" data-download-draft type="button">Скачать копию</button>`;
+  if (syncSaving) return `<span>Сохраняем изменения…</span>`;
+  if (remoteStateLoaded && syncDirty) return `<span>Изменения ожидают сохранения.</span>`;
+  return "";
+}
+
+function updateSyncNotice() {
+  const notice = app.querySelector("[data-sync-notice]");
+  if (!notice) return;
+  const content = renderSyncNotice();
+  notice.innerHTML = content;
+  notice.hidden = !content;
+}
+
+async function refreshSharedState() {
+  if (!auth.session?.guard || !remoteStateLoaded || syncPolling || syncSaving || syncConflict || document.visibilityState === "hidden") return;
+  if (syncDirty) { await saveStateToServer(); return; }
+  if (syncEditorOpen()) return;
+  const generation = syncGeneration;
+  syncPolling = true;
+  try {
+    const response = await fetch("/api/state", { cache: "no-store" });
+    if (!response.ok) return;
+    const result = await response.json();
+    if (generation !== syncGeneration || syncSaving || syncConflict || syncEditorOpen() || syncDirty) return;
+    const changed = !sameState(syncBase, result.state);
+    if (changed && result.state) {
+      syncBase = copyState(result.state);
+      state = normalizeState(copyState(result.state));
+      syncBase = copyState(state);
+      equipmentGroups = state.equipmentGroups;
+      if (!Object.hasOwn(equipmentGroups, ui.equipmentGroup)) ui.equipmentGroup = Object.keys(equipmentGroups)[0] || "";
+      syncError = "";
+      rememberStateDraft();
+    }
+    if (changed || syncNeedsRender) { syncNeedsRender = false; render(); if (!syncDirty) syncBase = copyState(state); }
+  } catch { /* Retry on the next interval; never replace a draft on a failed read. */ }
+  finally { if (generation === syncGeneration) syncPolling = false; }
 }
 
 function render() {
@@ -419,7 +566,7 @@ function render() {
         </div>
         <nav class="desktop-nav" aria-label="Разделы">${renderNavItems()}</nav>
       </header>
-      <main class="main" data-scroll-view="${ui.view}">${renderCurrentView()}</main>
+      <main class="main" data-scroll-view="${ui.view}"><div class="sync-notice" data-sync-notice role="status" ${renderSyncNotice() ? "" : "hidden"}>${renderSyncNotice()}</div>${renderCurrentView()}</main>
       <nav class="bottom-nav" aria-label="Разделы">${renderNavItems()}</nav>
       ${ui.sheet ? renderSheet() : ""}
       ${ui.modal ? renderModal() : ""}
@@ -510,6 +657,18 @@ function ensureAllowedView() {
 }
 
 async function activateSession(session) {
+  syncGeneration += 1;
+  syncBase = null;
+  syncSaving = false;
+  syncPolling = false;
+  syncConflict = null;
+  syncError = "";
+  syncNeedsRender = false;
+  syncDirty = false;
+  syncEditVersion = 0;
+  ui.equipmentSelectionMode = false;
+  ui.selectedEquipmentIds = [];
+  window.clearTimeout(persistTimer);
   auth.session = session;
   auth.error = "";
   state = loadState();
@@ -584,6 +743,10 @@ async function submitAuthForm(event) {
 }
 
 async function logout() {
+  rememberStateDraft();
+  syncGeneration += 1;
+  remoteStateLoaded = false;
+  window.clearTimeout(persistTimer);
   try {
     await apiRequest("/api/auth/logout", { method: "POST", body: "{}" });
   } catch {
@@ -1152,7 +1315,7 @@ function renderWorkView() {
   if (!Object.keys(equipmentGroups).length) return `
     <div class="page-title work-heading">
       <div><h1>Работа</h1><p class="muted">Пожарно-техническое вооружение подразделения</p></div>
-      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button></div>` : ""}
+      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="ghost-btn" data-manage-equipment-locations type="button">Места хранения</button></div>` : ""}
     </div>
     <section class="panel"><div class="empty-state"><h2>Создайте свои разделы оборудования</h2><p>${can("work.edit") ? "Нажмите «Настроить разделы», добавьте нужные названия и сохраните. Затем можно добавлять оборудование." : "Разделы оборудования ещё не настроены."}</p></div></section>
   `;
@@ -1170,7 +1333,7 @@ function renderWorkView() {
       <button class="icon-btn equipment-tool${ui.equipmentTool === "filter" ? " active" : ""}" data-equipment-tool="filter" data-active="${Boolean(ui.equipmentCondition || ui.equipmentSort !== "asc")}" aria-label="Фильтры оборудования" title="Фильтры" aria-expanded="${ui.equipmentTool === "filter"}" aria-controls="equipment-filter-panel" type="button"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 4h18l-7 8v7l-4 2V12Z"/></svg></button>
     </div>
     </div>
-      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>` : ""}
+      ${can("work.edit") ? `<div class="actions"><button class="ghost-btn" data-manage-equipment-groups type="button">Настроить разделы</button><button class="ghost-btn" data-manage-equipment-locations type="button">Места хранения</button><button class="btn" data-add-equipment type="button">+ Добавить</button></div>` : ""}
     </div>
     <div id="equipment-search-panel" class="equipment-search-panel" ${ui.equipmentTool === "search" ? "" : "hidden"}>
       <div class="field-group"><label for="equipment-search">Поиск по базе</label><input id="equipment-search" class="search" data-equipment-search type="search" placeholder="Название, номер или место хранения" value="${escapeAttr(ui.equipmentSearch)}" /></div>
@@ -1183,12 +1346,12 @@ function renderWorkView() {
       <button class="equipment-tab ${!ui.equipmentLocation && ui.equipmentGroup === key ? "active" : ""}" id="equipment-tab-${key}" data-equipment-group="${key}" role="tab" aria-selected="${!ui.equipmentLocation && ui.equipmentGroup === key}" aria-controls="equipment-group-panel" tabindex="${ui.equipmentGroup === key ? 0 : -1}" type="button">${escapeHtml(label)}</button>
     `).join("")}</div>
     <div class="equipment-location-filter">
-      <label for="equipment-location-filter">Выберите машину</label>
+      <label for="equipment-location-filter">Выберите место хранения</label>
       <select id="equipment-location-filter" class="field" data-equipment-location>
         <option value="">Все места хранения</option>
         ${locations.map((location) => `<option value="${escapeAttr(location)}" ${ui.equipmentLocation === location ? "selected" : ""}>${escapeHtml(location)}</option>`).join("")}
       </select>
-      ${locations.length ? `<span class="muted small">Список составлен из значений поля «Место хранения».</span>` : `<span class="muted small">Заполните «Место хранения» у экземпляров оборудования, и варианты появятся здесь.</span>`}
+      ${locations.length ? `<span class="muted small">Общий список машин, складов и других мест хранения караула.</span>` : `<span class="muted small">Добавьте машины и склады через кнопку «Места хранения».</span>`}
     </div>
     <section id="equipment-group-panel" role="tabpanel" aria-labelledby="equipment-tab-${ui.equipmentGroup}">
     <div class="equipment-summary">
@@ -1231,21 +1394,97 @@ function sameEquipmentLocation(left, right) {
 }
 
 function equipmentStorageLocations() {
+  return (state.equipmentLocations || []).map((item) => item.name)
+    .sort((a, b) => a.localeCompare(b, "ru", { numeric: true, sensitivity: "base" }));
+}
+
+function equipmentLocationKey(value) {
+  return normalizedEquipmentLocation(value).toLocaleLowerCase("ru");
+}
+
+function equipmentLocationRecords(equipment) {
+  return equipment.flatMap((item) => isQuantityEquipment(item) || !Array.isArray(item.instances) || !item.instances.length ? [item] : item.instances);
+}
+
+function normalizeEquipmentLocations(nextState) {
   const locations = new Map();
-  state.equipment.forEach((item) => {
-    const itemLocations = isQuantityEquipment(item) ? [item.location] : equipmentInstances(item).map((instance) => instance.location);
-    itemLocations.forEach((value) => {
-      const location = normalizedEquipmentLocation(value);
-      const key = location.toLocaleLowerCase("ru");
-      if (location && !locations.has(key)) locations.set(key, location);
-    });
+  const ids = new Set();
+  const add = (value, id, inventoryNumber = "") => {
+    const name = normalizedEquipmentLocation(value);
+    const key = equipmentLocationKey(name);
+    if (!name || locations.has(key)) return;
+    const locationId = typeof id === "string" && id && !ids.has(id) ? id : createId("location");
+    ids.add(locationId);
+    locations.set(key, { id: locationId, name, inventoryNumber: String(inventoryNumber || "").trim() });
+  };
+  (Array.isArray(nextState.equipmentLocations) ? nextState.equipmentLocations : []).forEach((item) => add(item?.name, item?.id, item?.inventoryNumber));
+  const records = equipmentLocationRecords(nextState.equipment || []);
+  records.forEach((record) => add(record.location));
+  nextState.equipmentLocations = [...locations.values()];
+}
+
+function renderEquipmentLocationOptions(current = "") {
+  return `<option value="">Не указано</option>${equipmentStorageLocations().map((name) => `<option value="${escapeAttr(name)}" ${sameEquipmentLocation(current, name) ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}`;
+}
+
+function saveEquipmentLocations(rows) {
+  if (!can("work.edit")) return "Недостаточно прав для изменения мест хранения.";
+  const previous = state.equipmentLocations || [];
+  const ids = new Set();
+  const canonical = new Map();
+  const namesById = new Map();
+  for (const row of rows) {
+    const name = normalizedEquipmentLocation(row.name);
+    const inventoryNumber = String(row.inventoryNumber || "").trim();
+    if (!row.id || ids.has(row.id) || !name || name.length > 160) return "Укажите название каждого места хранения (до 160 символов).";
+    if (inventoryNumber.length > 100) return "Номер по умолчанию должен быть не длиннее 100 символов.";
+    ids.add(row.id);
+    const key = equipmentLocationKey(name);
+    if (!canonical.has(key)) canonical.set(key, { id: row.id, name, inventoryNumber });
+    else {
+      const existing = canonical.get(key);
+      if (existing.inventoryNumber && inventoryNumber && existing.inventoryNumber !== inventoryNumber) return `У объединяемых мест «${name}» разные номера. Укажите одинаковый номер или оставьте один из номеров пустым.`;
+      existing.inventoryNumber ||= inventoryNumber;
+    }
+    namesById.set(row.id, canonical.get(key).name);
+  }
+  const records = equipmentLocationRecords(state.equipment);
+  const renames = new Map();
+  for (const location of previous) {
+    const used = records.some((record) => sameEquipmentLocation(record.location, location.name));
+    if (!namesById.has(location.id) && used) return `В месте «${location.name}» есть оборудование. Чтобы объединить места, задайте им одинаковые названия.`;
+    if (namesById.has(location.id)) renames.set(equipmentLocationKey(location.name), namesById.get(location.id));
+  }
+  records.forEach((record) => {
+    const oldKey = equipmentLocationKey(record.location);
+    if (!renames.has(oldKey)) return;
+    const newName = renames.get(oldKey);
+    const oldNumber = String(previous.find((location) => equipmentLocationKey(location.name) === oldKey)?.inventoryNumber || "").trim();
+    const number = String(record.inventoryNumber || "").trim();
+    if (!isQuantityEquipment(record) && (!number || number === oldNumber)) {
+      record.inventoryNumber = canonical.get(equipmentLocationKey(newName)).inventoryNumber;
+    }
+    record.location = newName;
   });
-  return [...locations.values()].sort((a, b) => a.localeCompare(b, "ru", { numeric: true, sensitivity: "base" }));
+  if (renames.has(equipmentLocationKey(ui.equipmentLocation))) ui.equipmentLocation = renames.get(equipmentLocationKey(ui.equipmentLocation));
+  state.equipmentLocations = [...canonical.values()];
+  return "";
 }
 
 function equipmentHasLocation(item, location) {
   if (isQuantityEquipment(item)) return sameEquipmentLocation(item.location, location);
   return equipmentInstances(item).some((instance) => sameEquipmentLocation(instance.location, location));
+}
+
+function renderEquipmentSelectionTools(visibleIds) {
+  if (!can("work.edit")) return "";
+  if (!ui.equipmentSelectionMode) return `<button class="ghost-btn compact-btn" data-select-equipment-mode type="button" ${visibleIds.length ? "" : "disabled"}>Выбрать позиции</button>`;
+  const count = ui.selectedEquipmentIds.length;
+  return `<span class="small" role="status">Выбрано позиций: ${count}</span><div class="actions">
+    <button class="ghost-btn compact-btn" data-select-visible-equipment type="button" ${visibleIds.length ? "" : "disabled"}>Выбрать все показанные</button>
+    <button class="btn compact-btn" data-move-selected-equipment type="button" ${count ? "" : "disabled"}>Перенести в раздел</button>
+    <button class="ghost-btn compact-btn" data-cancel-equipment-selection type="button">Отмена выбора</button>
+  </div>`;
 }
 
 function renderEquipmentResults() {
@@ -1260,28 +1499,33 @@ function renderEquipmentResults() {
       const total = Number.isSafeInteger(item.quantity) && item.quantity > 0 ? item.quantity : 1;
       const matches = (!ui.equipmentLocation || sameEquipmentLocation(item.location, ui.equipmentLocation))
         && (!ui.equipmentCondition || condition === ui.equipmentCondition)
-        && (!query || [item.name, item.category, item.location, comment, equipmentConditions[condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
+        && (!query || [item.name, ...(item.aliases || []), item.category, item.location, comment, equipmentConditions[condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
       return matches ? { item, instances: [], total, quantityOnly: true, condition, comment } : null;
     }
     const allInstances = equipmentInstances(item);
     const instances = allInstances.map((instance, index) => ({ ...instance, index }))
       .filter((instance) => !ui.equipmentLocation || sameEquipmentLocation(instance.location, ui.equipmentLocation))
       .filter((instance) => !ui.equipmentCondition || instance.condition === ui.equipmentCondition)
-      .filter((instance) => !query || [item.name, item.category, instance.inventoryNumber, instance.location, instance.comment, equipmentConditions[instance.condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
+      .filter((instance) => !query || [item.name, ...(item.aliases || []), item.category, instance.inventoryNumber, instance.location, instance.comment, equipmentConditions[instance.condition].label].join(" ").toLocaleLowerCase("ru").includes(query));
     return instances.length ? { item, instances, total: allInstances.length, quantityOnly: false } : null;
   }).filter(Boolean)
     .sort((a, b) => (ui.equipmentSort === "desc" ? -1 : 1) * a.item.name.localeCompare(b.item.name, "ru", { numeric: true, sensitivity: "base" }));
-  if (!items.length) return `<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : ui.equipmentLocation ? `В месте хранения «${escapeHtml(ui.equipmentLocation)}» оборудование не найдено` : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : ui.equipmentLocation ? "Проверьте место хранения у нужного экземпляра." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
+  const tools = can("work.edit") ? `<div class="equipment-selection-tools" data-equipment-selection-tools data-visible-equipment="${escapeAttr(JSON.stringify(items.map(({ item }) => item.id)))}">${renderEquipmentSelectionTools(items.map(({ item }) => item.id))}</div>` : "";
+  if (!items.length) return `${tools}<section class="panel"><div class="empty-state"><h2>${groupItems.length ? "Ничего не найдено" : ui.equipmentLocation ? `В месте хранения «${escapeHtml(ui.equipmentLocation)}» оборудование не найдено` : `В разделе «${escapeHtml(equipmentGroups[ui.equipmentGroup])}» пока нет оборудования`}</h2><p>${groupItems.length ? "Измените запрос или выберите другое состояние." : ui.equipmentLocation ? "Проверьте место хранения у нужного экземпляра." : "Нажмите «Добавить», чтобы внести первую позицию."}</p></div></section>`;
   return `
+    ${tools}
     ${query || ui.equipmentCondition ? `<p class="muted small" role="status">Показано ${items.length} из ${groupItems.length}</p>` : ""}
     <div class="equipment-list">${items.map(({ item, instances, total, quantityOnly, condition, comment }) => {
       const collapsed = !ui.expandedEquipmentIds.includes(item.id);
       const bodyId = `equipment-card-body-${item.id}`;
       return `<article class="panel equipment-card${collapsed ? " collapsed" : ""}">
+        <div class="equipment-card-top">
+        ${can("work.edit") && ui.equipmentSelectionMode ? `<input class="equipment-select-checkbox" type="checkbox" data-select-equipment="${escapeAttr(item.id)}" aria-label="Выбрать: ${escapeAttr(item.name)}" ${ui.selectedEquipmentIds.includes(item.id) ? "checked" : ""} />` : ""}
         <button class="equipment-card-toggle" data-toggle-equipment="${escapeAttr(item.id)}" type="button" aria-expanded="${!collapsed}" aria-controls="${escapeAttr(bodyId)}">
           <h2>${escapeHtml(item.name)}</h2>
           <span class="equipment-card-chevron" aria-hidden="true">⌄</span>
         </button>
+        </div>
         <div class="equipment-card-body" id="${escapeAttr(bodyId)}" ${collapsed ? "hidden" : ""}>
           <dl class="equipment-details">
             <div><dt>Количество</dt><dd>${total} ${escapeHtml(item.unit || "шт.")}</dd></div>
@@ -1311,21 +1555,94 @@ function renderEquipmentResults() {
   `;
 }
 
+function moveEquipmentToGroup(ids, group) {
+  if (!can("work.edit")) return { error: "Недостаточно прав для переноса оборудования." };
+  if (!Object.hasOwn(equipmentGroups, group)) return { error: "Выберите существующий раздел." };
+  const selected = new Set(ids);
+  const items = state.equipment.filter((item) => selected.has(item.id));
+  if (!items.length || items.length !== selected.size) return { error: "Список оборудования изменился. Закройте окно и проверьте выбранные позиции." };
+  let count = 0;
+  const now = new Date().toISOString();
+  items.forEach((item) => {
+    if (item.group === group) return;
+    item.group = group;
+    item.updatedAt = now;
+    count += 1;
+  });
+  return { count };
+}
+
+function renderEquipmentMoveModal() {
+  const selected = new Set(ui.selectedEquipmentIds);
+  const items = state.equipment.filter((item) => selected.has(item.id));
+  return `<div class="modal-backdrop"><form class="modal" data-equipment-move-form>
+    <div class="modal-head"><h2>Перенести в раздел</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть перенос">×</button></div>
+    <div class="modal-body"><p>Выбрано позиций: ${items.length}</p><ul>${items.map((item) => `<li>${escapeHtml(item.name)} — ${isQuantityEquipment(item) ? item.quantity : equipmentInstances(item).length} ${escapeHtml(item.unit || "шт.")}</li>`).join("")}</ul>
+      <p class="muted small">Каждая позиция переносится целиком, со всеми экземплярами, в том числе на других машинах. Номера, места хранения, состояния и комментарии сохраняются.</p>
+      <div class="field-group"><label for="equipment-move-group">В какой раздел перенести?</label><select class="field" id="equipment-move-group" name="group" required><option value="">Выберите раздел</option>${Object.entries(equipmentGroups).map(([id, name]) => `<option value="${escapeAttr(id)}">${escapeHtml(name)}</option>`).join("")}</select></div>
+      <p class="muted small">Если нужен новый раздел, сначала создайте его через «Настроить разделы».</p>
+      <p class="form-error small" data-equipment-move-error role="alert" hidden></p>
+      <div class="actions"><button class="ghost-btn" data-close-modal type="button">Отмена</button><button class="btn" type="submit">Перенести</button></div>
+    </div></form></div>`;
+}
+
+function bindEquipmentMoveForm() {
+  const form = document.querySelector("[data-equipment-move-form]");
+  if (!form) return;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const group = form.elements.group.value;
+    const result = moveEquipmentToGroup(ui.selectedEquipmentIds, group);
+    if (result.error) {
+      const error = form.querySelector("[data-equipment-move-error]");
+      error.textContent = result.error; error.hidden = false; return;
+    }
+    ui.equipmentSelectionMode = false;
+    ui.selectedEquipmentIds = [];
+    ui.equipmentGroup = group;
+    ui.equipmentLocation = "";
+    ui.equipmentSearch = "";
+    ui.equipmentCondition = "";
+    ui.expandedEquipmentIds = [];
+    ui.modal = null;
+    if (result.count) persist();
+    render();
+    showToast(result.count ? `Перенесено позиций: ${result.count}` : "Выбранные позиции уже находятся в этом разделе");
+  });
+}
+
 function renderEquipmentInstanceFields(instance = {}, index = 0) {
   const fieldId = createId("equipment-instance");
+  const defaultNumber = equipmentLocationDefaultNumber(instance.location);
+  const number = instance.inventoryNumber || defaultNumber;
   return `<fieldset class="equipment-instance-fields" data-equipment-instance>
     <legend>Экземпляр <span data-instance-number>${index + 1}</span></legend>
-    <div class="field-group"><label for="${fieldId}-number">Инвентарный / заводской номер</label><input id="${fieldId}-number" class="field" name="instanceNumber" maxlength="100" value="${escapeAttr(instance.inventoryNumber || "")}" /></div>
-    <div class="field-group"><label for="${fieldId}-location">Место хранения</label><input id="${fieldId}-location" class="field" name="instanceLocation" maxlength="160" value="${escapeAttr(instance.location || "")}" placeholder="Например: склад, стеллаж 2" /></div>
+    <div class="field-group"><label for="${fieldId}-location">Место хранения</label><select id="${fieldId}-location" class="field" name="instanceLocation">${renderEquipmentLocationOptions(instance.location)}</select></div>
+    <div class="field-group"><label for="${fieldId}-number">Инвентарный / заводской номер</label><input id="${fieldId}-number" class="field" name="instanceNumber" maxlength="100" value="${escapeAttr(number)}" data-auto-location-number="${escapeAttr(number === defaultNumber ? defaultNumber : "")}" /><span class="muted small">Подставляется номер выбранного места хранения. Для исключений впишите свой.</span></div>
     <div class="field-group"><label for="${fieldId}-condition">Состояние</label><select id="${fieldId}-condition" class="field" name="instanceCondition">${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${(instance.condition || "READY") === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
     <div class="field-group"><label for="${fieldId}-comment">Комментарий</label><textarea id="${fieldId}-comment" class="field" name="instanceComment" maxlength="1000" placeholder="Комплектация, особенности, замечания">${escapeHtml(instance.comment || "")}</textarea></div>
     <button class="danger-btn" data-remove-instance type="button">Удалить экземпляр</button>
   </fieldset>`;
 }
 
+function equipmentLocationDefaultNumber(location) {
+  return (state.equipmentLocations || []).find((item) => sameEquipmentLocation(item.name, location))?.inventoryNumber || "";
+}
+
 function bindEquipmentInstances() {
   const list = document.querySelector("[data-equipment-instances]");
   if (!list) return;
+  list.addEventListener("change", (event) => {
+    if (event.target.name !== "instanceLocation") return;
+    const number = event.target.closest("[data-equipment-instance]").querySelector('[name="instanceNumber"]');
+    if (!number.value.trim() || number.value === number.dataset.autoLocationNumber) {
+      number.value = equipmentLocationDefaultNumber(event.target.value);
+      number.dataset.autoLocationNumber = number.value;
+    }
+  });
+  list.addEventListener("input", (event) => {
+    if (event.target.name === "instanceNumber") event.target.dataset.autoLocationNumber = "";
+  });
   const form = list.closest("form");
   const trackingMode = form.querySelector("[data-equipment-tracking-mode]");
   const quantity = form.querySelector("#equipment-quantity");
@@ -1362,18 +1679,21 @@ function bindEquipmentInstances() {
 
 function renderEquipmentFormModal() {
   const item = state.equipment.find((entry) => entry.id === ui.modal.equipmentId);
-  const data = item || { quantity: 1, unit: "шт.", condition: "READY" };
+  const data = ui.modal.draft || item || { quantity: 1, unit: "шт.", condition: "READY" };
   const trackingMode = isQuantityEquipment(data) ? "quantity" : "instances";
   const instances = trackingMode === "quantity"
     ? [{ inventoryNumber: "", location: data.location || "", condition: data.condition || "READY", comment: data.comment || data.notes || "" }]
     : equipmentInstances(data);
-  const group = item ? equipmentGroup(item) : ui.equipmentGroup;
+  const group = data.group || ui.equipmentGroup;
   return `
     <div class="modal-backdrop"><form class="modal" data-equipment-form>
       <div class="modal-head"><h2>${item ? "Карточка оборудования" : "Добавить оборудование"}</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть карточку оборудования">×</button></div>
       <div class="modal-body">
+        ${ui.modal.returnModal ? `<button class="ghost-btn" data-return-equipment-draft type="button">← Вернуться к введённой записи</button>` : ""}
         <div class="field-group"><label for="equipment-group">Раздел</label><select id="equipment-group" class="field" name="group">${Object.entries(equipmentGroups).map(([key, label]) => `<option value="${key}" ${key === group ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></div>
-        <div class="field-group"><label for="equipment-name">Наименование</label><input id="equipment-name" class="field" name="name" required maxlength="160" value="${escapeAttr(data.name || "")}" placeholder="Например: пожарный рукав" /></div>
+        <div class="field-group"><label for="equipment-name">Наименование</label><input id="equipment-name" class="field" name="name" required maxlength="160" value="${escapeAttr(data.name || "")}" placeholder="Например: пожарный рукав" aria-describedby="equipment-name-matches" /></div>
+        <div id="equipment-name-matches" class="equipment-name-matches" data-equipment-name-matches hidden></div>
+        <div class="field-group"><label for="equipment-aliases">Другие названия и сокращения</label><textarea id="equipment-aliases" class="field" name="aliases" maxlength="1000" placeholder="Через запятую или каждое с новой строки">${escapeHtml((data.aliases || []).join(", "))}</textarea><span class="muted small">Укажите принятые у вас сокращения. По ним тоже найдётся эта карточка.</span></div>
         <div class="field-group"><label for="equipment-category">Категория</label><input id="equipment-category" class="field" name="category" maxlength="100" value="${escapeAttr(data.category || "")}" placeholder="Например: рукавное оборудование" /></div>
         <div class="field-group"><label for="equipment-tracking-mode">Способ учёта</label><select id="equipment-tracking-mode" class="field" name="trackingMode" data-equipment-tracking-mode><option value="instances" ${trackingMode === "instances" ? "selected" : ""}>По экземплярам</option><option value="quantity" ${trackingMode === "quantity" ? "selected" : ""}>Только количество</option></select></div>
         <div class="equipment-form-grid">
@@ -1381,13 +1701,13 @@ function renderEquipmentFormModal() {
           <div class="field-group"><label for="equipment-unit">Единица учёта</label><input id="equipment-unit" class="field" name="unit" required maxlength="20" value="${escapeAttr(data.unit || "шт.")}" placeholder="шт., комплект" /></div>
         </div>
         <div data-instance-mode-fields ${trackingMode === "quantity" ? "hidden" : ""}>
-          <p class="muted small">У каждого экземпляра — свой номер, место хранения, состояние и комментарий. Количество рассчитывается автоматически.</p>
+          <p class="muted small">У каждого экземпляра — свой номер, место хранения, состояние и комментарий. Количество рассчитывается автоматически. Новое место добавляется через кнопку «Места хранения» в разделе «Работа».</p>
           <div class="equipment-instances" data-equipment-instances>${instances.map(renderEquipmentInstanceFields).join("")}</div>
           <button class="ghost-btn equipment-add-instance" data-add-instance type="button">+ Добавить экземпляр</button>
         </div>
         <div data-quantity-mode-fields ${trackingMode === "instances" ? "hidden" : ""}>
           <p class="muted small">Для однотипного имущества достаточно общего количества без создания отдельных экземпляров.</p>
-          <div class="field-group"><label for="equipment-bulk-location">Место хранения</label><input id="equipment-bulk-location" class="field" name="bulkLocation" maxlength="160" value="${escapeAttr(data.location || "")}" placeholder="Например: АЦ 720 или склад" /></div>
+          <div class="field-group"><label for="equipment-bulk-location">Место хранения</label><select id="equipment-bulk-location" class="field" name="bulkLocation">${renderEquipmentLocationOptions(data.location)}</select></div>
           <div class="field-group"><label for="equipment-bulk-condition">Состояние</label><select id="equipment-bulk-condition" class="field" name="bulkCondition">${Object.entries(equipmentConditions).map(([key, value]) => `<option value="${key}" ${(data.condition || "READY") === key ? "selected" : ""}>${value.label}</option>`).join("")}</select></div>
           <div class="field-group"><label for="equipment-bulk-comment">Комментарий</label><textarea id="equipment-bulk-comment" class="field" name="bulkComment" maxlength="1000" placeholder="Комплектация, особенности, замечания">${escapeHtml(data.comment || data.notes || "")}</textarea></div>
         </div>
@@ -1398,11 +1718,119 @@ function renderEquipmentFormModal() {
   `;
 }
 
+function equipmentFormNameMatches(form) {
+  const queries = [form.elements.name.value, ...parseEquipmentAliases(form.elements.aliases.value)];
+  return [...new Map(queries.flatMap((query) => findEquipmentNameMatches(query, state.equipment, ui.modal.equipmentId)).map((match) => [match.item.id, match])).values()].slice(0, 8);
+}
+
+function updateEquipmentNameMatches(form) {
+  const panel = form.querySelector("[data-equipment-name-matches]");
+  const matches = equipmentFormNameMatches(form);
+  panel.hidden = !matches.length;
+  const signature = JSON.stringify([form.elements.name.value, form.elements.aliases.value, matches.map(({ item }) => item.id)]);
+  if (panel.dataset.signature === signature) return;
+  panel.dataset.signature = signature;
+  panel.innerHTML = matches.length ? `<p class="small" role="status">${matches.some((match) => match.exact) ? "Такое наименование или сокращение уже есть в базе." : "В базе есть похожие наименования — проверьте, не та же ли это вещь."}</p>
+    <div class="equipment-name-match-list">${matches.map(({ item, matchedName }) => `<button class="ghost-btn equipment-name-match" data-open-equipment-match="${escapeAttr(item.id)}" type="button"><strong>${escapeHtml(item.name)}</strong>${matchedName !== item.name ? `<span class="small">Другое название: ${escapeHtml(matchedName)}</span>` : ""}<span class="muted small">${escapeHtml(equipmentGroups[equipmentGroup(item)] || "Без раздела")} · ${isQuantityEquipment(item) ? item.quantity : equipmentInstances(item).length} ${escapeHtml(item.unit || "шт.")} · Открыть карточку</span></button>`).join("")}</div>
+    <p class="muted small">Если это та же вещь, добавьте экземпляр в её карточку или увеличьте количество.</p>
+    <label class="equipment-name-confirm"><input type="checkbox" data-confirm-separate-equipment />Это другое оборудование — сохранить отдельной позицией</label>` : "";
+}
+
+function equipmentFormDraft(form) {
+  const data = new FormData(form);
+  const numbers = data.getAll("instanceNumber"), locations = data.getAll("instanceLocation"), conditions = data.getAll("instanceCondition"), comments = data.getAll("instanceComment");
+  return { name: data.get("name"), aliases: parseEquipmentAliases(data.get("aliases")), group: data.get("group"), category: data.get("category"), trackingMode: data.get("trackingMode"), quantity: Number(data.get("quantity")), unit: data.get("unit"), location: data.get("bulkLocation"), condition: data.get("bulkCondition"), comment: data.get("bulkComment"), instances: numbers.map((inventoryNumber, index) => ({ inventoryNumber, location: locations[index], condition: conditions[index], comment: comments[index] })) };
+}
+
+function bindEquipmentNameMatches() {
+  const form = document.querySelector("[data-equipment-form]");
+  if (!form) return;
+  updateEquipmentNameMatches(form);
+  const update = () => {
+    updateEquipmentNameMatches(form);
+    form.querySelector("[data-equipment-error]").hidden = true;
+  };
+  form.elements.name.addEventListener("input", update);
+  form.elements.aliases.addEventListener("input", update);
+  form.querySelector("[data-equipment-name-matches]").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-open-equipment-match]");
+    if (!button) return;
+    const returnModal = { ...ui.modal, draft: equipmentFormDraft(form) };
+    ui.modal = { type: "equipmentForm", equipmentId: button.dataset.openEquipmentMatch, returnModal };
+    render();
+  });
+  form.querySelector("[data-return-equipment-draft]")?.addEventListener("click", () => {
+    ui.modal = ui.modal.returnModal;
+    render();
+  });
+}
+
+function renderEquipmentLocationRow(location = { id: createId("location"), name: "" }) {
+  const used = Boolean(location.name) && equipmentLocationRecords(state.equipment).some((record) => sameEquipmentLocation(record.location, location.name));
+  return `<div class="equipment-location-row" data-location-row>
+    <input type="hidden" name="locationId" value="${escapeAttr(location.id)}" />
+    <label class="field-group">Название места хранения<input class="field" name="locationName" required maxlength="160" value="${escapeAttr(location.name)}" placeholder="Например: АЦ 1 или склад" /></label>
+    <label class="field-group">Номер по умолчанию (необязательно)<input class="field" name="locationNumber" maxlength="100" value="${escapeAttr(location.inventoryNumber || "")}" placeholder="Номер машины для оборудования на ней" /></label>
+    ${used ? `<p class="muted small">Здесь есть оборудование. При переименовании оно останется на этом месте.</p>` : ""}
+    <button class="danger-btn compact-btn" data-remove-location type="button" ${used ? 'disabled title="Сначала перенесите оборудование или объедините это место с другим"' : ""}>Удалить место</button>
+  </div>`;
+}
+
+function renderEquipmentLocationsModal() {
+  return `<div class="modal-backdrop"><form class="modal" data-equipment-locations-form>
+    <div class="modal-head"><h2>Места хранения</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть места хранения">×</button></div>
+    <div class="modal-body">
+      <p class="muted small">Общий список для всех участников караула. Добавьте машины, склады и другие места. В ПТВ место выбирается из этого списка.</p>
+      <p class="muted small">Номер по умолчанию подставляется при выборе места в экземпляре ПТВ. При его изменении пустые номера и номера, совпадающие с прежним номером машины, обновятся. Отличающиеся номера-исключения сохранятся.</p>
+      <p class="muted small">Ранее заполненные места сохранены. Чтобы объединить дубли одной машины, задайте им одинаковое название и сохраните. Всё оборудование останется в общем месте.</p>
+      <div data-location-rows>${(state.equipmentLocations || []).map(renderEquipmentLocationRow).join("")}</div>
+      <p class="form-error small" data-locations-error role="alert" hidden></p>
+      <div class="actions"><button class="ghost-btn" data-add-location type="button">+ Добавить место</button><button class="btn" type="submit">Сохранить</button></div>
+    </div>
+  </form></div>`;
+}
+
+function bindEquipmentLocationsForm() {
+  const form = document.querySelector("[data-equipment-locations-form]");
+  if (!form) return;
+  const rows = form.querySelector("[data-location-rows]");
+  form.querySelector("[data-add-location]").addEventListener("click", () => {
+    rows.insertAdjacentHTML("beforeend", renderEquipmentLocationRow());
+    rows.lastElementChild.querySelector('[name="locationName"]').focus();
+  });
+  rows.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-location]");
+    if (button && !button.disabled) button.closest("[data-location-row]").remove();
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const ids = data.getAll("locationId");
+    const names = data.getAll("locationName");
+    const numbers = data.getAll("locationNumber");
+    const error = saveEquipmentLocations(ids.map((id, index) => ({ id, name: names[index], inventoryNumber: numbers[index] })));
+    if (error) {
+      const message = form.querySelector("[data-locations-error]");
+      message.textContent = error;
+      message.hidden = false;
+      return;
+    }
+    persist();
+    ui.modal = null;
+    render();
+    showToast("Места хранения сохранены");
+  });
+}
+
 function renderEquipmentGroupField(id, label = "") {
   return `<div class="field-group" data-group-row>
     <input type="hidden" name="groupId" value="${escapeAttr(id)}" />
     <label for="group-label-${id}">${label ? "Название раздела" : "Новый раздел"}</label>
     <input id="group-label-${id}" class="field" name="groupLabel" value="${escapeAttr(label)}" required maxlength="60" placeholder="Например: Связь" />
+    <div class="actions group-order-actions">
+      <button class="ghost-btn compact-btn" data-move-group="up" type="button" aria-label="Переместить раздел выше">↑ Выше</button>
+      <button class="ghost-btn compact-btn" data-move-group="down" type="button" aria-label="Переместить раздел ниже">↓ Ниже</button>
+    </div>
   </div>`;
 }
 
@@ -1410,7 +1838,7 @@ function renderEquipmentGroupsModal() {
   return `<div class="modal-backdrop"><form class="modal" data-equipment-groups-form>
     <div class="modal-head"><h2>Разделы оборудования</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть настройку разделов">×</button></div>
     <div class="modal-body">
-      <p class="muted small">Переименуйте разделы или добавьте свои. Оборудование останется в своём разделе.</p>
+      <p class="muted small">Переименуйте разделы или добавьте свои. Кнопками «Выше» и «Ниже» измените порядок: верхний раздел будет первым в ряду. Оборудование останется в своём разделе. Нажмите «Сохранить», чтобы применить изменения для всего караула.</p>
       <div data-group-fields>${Object.entries(equipmentGroups).map(([id, label]) => renderEquipmentGroupField(id, label)).join("")}</div>
       <p class="form-error small" data-groups-error role="alert" hidden></p>
       <div class="actions"><button class="ghost-btn" data-add-equipment-group type="button">+ Добавить раздел</button><button class="btn" type="submit">Сохранить</button></div>
@@ -1421,9 +1849,27 @@ function renderEquipmentGroupsModal() {
 function bindEquipmentGroupsForm() {
   const form = document.querySelector("[data-equipment-groups-form]");
   if (!form) return;
+  const fields = form.querySelector("[data-group-fields]");
+  const syncOrderButtons = () => {
+    const rows = [...fields.querySelectorAll("[data-group-row]")];
+    rows.forEach((row, index) => {
+      row.querySelector('[data-move-group="up"]').disabled = index === 0;
+      row.querySelector('[data-move-group="down"]').disabled = index === rows.length - 1;
+    });
+  };
+  syncOrderButtons();
+  fields.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-move-group]");
+    if (!button || button.disabled) return;
+    const row = button.closest("[data-group-row]");
+    if (button.dataset.moveGroup === "up" && row.previousElementSibling) row.previousElementSibling.before(row);
+    else if (button.dataset.moveGroup === "down" && row.nextElementSibling) row.nextElementSibling.after(row);
+    syncOrderButtons();
+    row.scrollIntoView({ block: "nearest" });
+  });
   form.querySelector("[data-add-equipment-group]").addEventListener("click", () => {
-    const fields = form.querySelector("[data-group-fields]");
     fields.insertAdjacentHTML("beforeend", renderEquipmentGroupField(createId("group")));
+    syncOrderButtons();
     fields.lastElementChild.querySelector('[name="groupLabel"]').focus();
   });
   form.addEventListener("input", () => { form.querySelector("[data-groups-error]").hidden = true; });
@@ -1511,6 +1957,10 @@ function bindEquipmentTabsScroll() {
 }
 
 function bindWorkEvents() {
+  document.querySelector("[data-manage-equipment-locations]")?.addEventListener("click", () => {
+    ui.modal = { type: "equipmentLocations" };
+    render();
+  });
   bindEquipmentTabsScroll();
   document.querySelectorAll("[data-equipment-tool]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1527,6 +1977,8 @@ function bindWorkEvents() {
     button.addEventListener("click", () => {
       if (!ui.equipmentLocation && ui.equipmentGroup === button.dataset.equipmentGroup) return;
       ui.equipmentGroup = button.dataset.equipmentGroup;
+      ui.equipmentSelectionMode = false;
+      ui.selectedEquipmentIds = [];
       ui.expandedEquipmentIds = [];
       ui.equipmentLocation = "";
       ui.equipmentSearch = "";
@@ -1557,6 +2009,8 @@ function bindWorkEvents() {
   });
   document.querySelector("[data-equipment-location]")?.addEventListener("change", (event) => {
     ui.equipmentLocation = event.target.value;
+    ui.equipmentSelectionMode = false;
+    ui.selectedEquipmentIds = [];
     ui.expandedEquipmentIds = [];
     ui.equipmentSearch = "";
     ui.equipmentCondition = "";
@@ -1575,7 +2029,28 @@ function bindWorkEvents() {
     document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
     saveUiState();
   });
+  document.querySelector("[data-equipment-results]")?.addEventListener("change", (event) => {
+    if (!event.target.matches("[data-select-equipment]") || !can("work.edit")) return;
+    const id = event.target.dataset.selectEquipment;
+    ui.selectedEquipmentIds = event.target.checked ? [...new Set([...ui.selectedEquipmentIds, id])] : ui.selectedEquipmentIds.filter((itemId) => itemId !== id);
+    const tools = document.querySelector("[data-equipment-selection-tools]");
+    tools.innerHTML = renderEquipmentSelectionTools(JSON.parse(tools.dataset.visibleEquipment));
+  });
   document.querySelector("[data-equipment-results]")?.addEventListener("click", (event) => {
+    if (can("work.edit") && event.target.closest("[data-select-equipment-mode], [data-cancel-equipment-selection], [data-select-visible-equipment], [data-move-selected-equipment]")) {
+      if (event.target.closest("[data-move-selected-equipment]")) {
+        if (ui.selectedEquipmentIds.length) { ui.modal = { type: "equipmentMove" }; render(); }
+        return;
+      }
+      if (event.target.closest("[data-select-equipment-mode]")) ui.equipmentSelectionMode = true;
+      if (event.target.closest("[data-cancel-equipment-selection]")) { ui.equipmentSelectionMode = false; ui.selectedEquipmentIds = []; }
+      if (event.target.closest("[data-select-visible-equipment]")) {
+        const ids = JSON.parse(document.querySelector("[data-equipment-selection-tools]").dataset.visibleEquipment);
+        ui.selectedEquipmentIds = [...new Set([...ui.selectedEquipmentIds, ...ids])];
+      }
+      document.querySelector("[data-equipment-results]").innerHTML = renderEquipmentResults();
+      return;
+    }
     const toggle = event.target.closest("[data-toggle-equipment]");
     if (toggle) {
       const id = toggle.dataset.toggleEquipment;
@@ -1601,6 +2076,13 @@ function saveEquipmentFromForm(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   const values = Object.fromEntries(["name", "group", "category", "unit"].map((key) => [key, String(form.get(key) || "").trim()]));
+  values.aliases = parseEquipmentAliases(form.get("aliases"));
+  if (values.aliases.length > 32 || values.aliases.some((name) => name.length > 160)) {
+    const error = event.currentTarget.querySelector("[data-equipment-error]");
+    error.textContent = "Укажите до 32 других названий, каждое не длиннее 160 символов.";
+    error.hidden = false;
+    return;
+  }
   const trackingMode = form.get("trackingMode") === "quantity" ? "quantity" : "instances";
   const locations = form.getAll("instanceLocation");
   const conditions = form.getAll("instanceCondition");
@@ -1615,6 +2097,13 @@ function saveEquipmentFromForm(event) {
   const bulkCondition = String(form.get("bulkCondition") || "");
   const invalidQuantityItem = trackingMode === "quantity" && (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1_000_000 || !Object.hasOwn(equipmentConditions, bulkCondition));
   const invalidInstanceItem = trackingMode === "instances" && (!instances.length || instances.some((instance) => !Object.hasOwn(equipmentConditions, instance.condition)));
+  const selectedLocations = trackingMode === "quantity" ? [String(form.get("bulkLocation") || "")] : instances.map((instance) => instance.location);
+  if (selectedLocations.some((location) => location && !equipmentStorageLocations().includes(location))) {
+    const error = event.currentTarget.querySelector("[data-equipment-error]");
+    error.textContent = "Выберите место хранения из общего списка. Новое место добавляется через кнопку «Места хранения» в разделе «Работа».";
+    error.hidden = false;
+    return;
+  }
   if (!values.name || !values.unit || !Object.hasOwn(equipmentGroups, values.group) || invalidQuantityItem || invalidInstanceItem) {
     const error = event.currentTarget.querySelector("[data-equipment-error]");
     error.textContent = trackingMode === "quantity"
@@ -1624,6 +2113,16 @@ function saveEquipmentFromForm(event) {
     return;
   }
   const existing = state.equipment.find((item) => item.id === ui.modal.equipmentId);
+  const renamed = !existing || existing.name.trim() !== values.name || !sameState(existing.aliases || [], values.aliases);
+  const matches = equipmentFormNameMatches(event.currentTarget);
+  if (renamed && matches.length && !event.currentTarget.querySelector("[data-confirm-separate-equipment]:checked")) {
+    const error = event.currentTarget.querySelector("[data-equipment-error]");
+    error.textContent = "В базе есть похожее оборудование. Откройте его карточку или отметьте, что это отдельная позиция.";
+    error.hidden = false;
+    updateEquipmentNameMatches(event.currentTarget);
+    event.currentTarget.querySelector("[data-equipment-name-matches]").scrollIntoView({ block: "nearest" });
+    return;
+  }
   const now = new Date().toISOString();
   const equipmentData = trackingMode === "quantity"
     ? {
@@ -1945,7 +2444,77 @@ function renderStatusPickerSheet() {
   `;
 }
 
+function syncConflictValue(value, path) {
+  if (path.length === 1) return value?.[path[0]];
+  const collection = value?.[path[0]];
+  if (path[1] === "$order") return collection?.map((item) => item.name || item.shortName || item.text || item.id);
+  return Array.isArray(collection) ? collection.find((item) => item.id === path[1]) : collection?.[path[1]];
+}
+
+function describeSyncValue(value) {
+  if (value == null) return "Запись удалена или ещё не создана.";
+  if (typeof value !== "object") return String(value);
+  if (Array.isArray(value)) return value.map((item, index) => `${index + 1}. ${describeSyncValue(item)}`).join("\n");
+  const labels = { name: "Название", shortName: "ФИО", lastName: "Фамилия", firstName: "Имя", middleName: "Отчество", position: "Должность", additionalProfession: "Доп. профессия", category: "Категория", group: "Раздел", unit: "Единица учёта", quantity: "Количество", inventoryNumber: "Номер", location: "Место хранения", condition: "Состояние", comment: "Комментарий", notes: "Примечание", instances: "Экземпляры", title: "Блок", members: "Состав", date: "Дата", blocks: "Блоки", text: "Текст", weekday: "День недели", isActive: "Активен", absenceType: "Отсутствие", dateFrom: "С", dateTo: "По", replacedName: "Кого заменяет", substitutions: "Подмены и дополнительные сотрудники", trackingMode: "Способ учёта", kind: "Тип записи", employeeId: "Сотрудник", replacedEmployeeId: "Кого заменяет" };
+  labels.aliases = "Другие названия и сокращения";
+  return Object.entries(value).filter(([key]) => !["id", "createdAt", "updatedAt", "version", "sentVersion", "sentToVkAt"].includes(key)).map(([key, item]) => {
+    if (key === "condition") item = equipmentConditions[item]?.label || item;
+    if (key === "group") item = equipmentGroups[item] || item;
+    if (key === "absenceType") item = absenceLabels[item] || item;
+    if (key === "trackingMode") item = item === "quantity" ? "Только количество" : "По экземплярам";
+    if (key === "kind") item = item === "additional" ? "Дополнительный сотрудник" : "Подмена";
+    if (["employeeId", "replacedEmployeeId"].includes(key)) item = findEmployee(item)?.shortName || "Не указан";
+    if (key === "isActive") item = item ? "Да" : "Нет";
+    if (key === "members" && Array.isArray(item)) item = item.map((id) => findEmployee(id)?.shortName || state.rosters?.[ui.selectedDate]?.substitutions?.[id]?.name || "Сотрудник");
+    return `${labels[key] || key}: ${item && typeof item === "object" ? describeSyncValue(item) : String(item ?? "")}`;
+  }).join("\n");
+}
+
+function renderSyncConflictModal() {
+  if (!syncConflict) return "";
+  const merged = mergeSharedState(syncConflict.base, state, syncConflict.remote);
+  const conflicts = [...new Map([...syncConflict.conflicts, ...merged.conflicts].map((item) => [item.key, item])).values()];
+  return `<div class="modal-backdrop"><form class="modal" data-sync-conflict-form>
+    <div class="modal-head"><h2>Запись изменили одновременно</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть сравнение">×</button></div>
+    <div class="modal-body"><p class="muted small">Сохранение приостановлено. Ваша версия остаётся в этом браузере. Сравните записи и выберите, какой вариант оставить. Остальные изменения объединятся автоматически.</p>
+      ${conflicts.map((conflict, index) => `<section class="sync-conflict-record"><h3>${escapeHtml(conflict.label)}</h3>
+        <h4>Ваш вариант</h4><pre>${escapeHtml(describeSyncValue(syncConflictValue(state, conflict.path)))}</pre>
+        <h4>Сохранённый вариант другого участника</h4><pre>${escapeHtml(describeSyncValue(syncConflictValue(syncConflict.remote, conflict.path)))}</pre>
+        <label class="field-group" for="sync-choice-${index}">Какой вариант оставить?<select class="field" id="sync-choice-${index}" data-sync-choice="${escapeAttr(conflict.key)}" required><option value="">Выберите вариант</option><option value="local">Мой вариант</option><option value="remote">Вариант другого участника</option></select></label>
+      </section>`).join("")}
+      <div class="actions"><button class="ghost-btn" data-download-draft type="button">Скачать мою копию</button><button class="btn" type="submit">Сохранить выбранное</button></div>
+    </div></form></div>`;
+}
+
+function resolveSyncConflict(event) {
+  event.preventDefault();
+  if (!syncConflict) return;
+  const choices = Object.fromEntries([...event.currentTarget.querySelectorAll("[data-sync-choice]")].map((select) => [select.dataset.syncChoice, select.value]));
+  if (Object.values(choices).some((value) => !["local", "remote"].includes(value))) return;
+  const merged = mergeSharedState(syncConflict.base, state, syncConflict.remote, choices);
+  if (merged.conflicts.length) { syncConflict.conflicts = merged.conflicts; render(); return; }
+  syncBase = copyState(syncConflict.remote);
+  state = normalizeState(copyState(merged.state));
+  equipmentGroups = state.equipmentGroups;
+  syncConflict = null;
+  syncError = "";
+  ui.modal = null;
+  persist();
+  render();
+}
+
+function downloadStateDraft() {
+  const blob = new Blob([JSON.stringify({ savedAt: new Date().toISOString(), base: syncBase, state }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = `Караул-копия-${isoDate(new Date())}.json`; link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function renderModal() {
+  if (ui.modal.type === "equipmentMove") return renderEquipmentMoveModal();
+  if (ui.modal.type === "syncConflict") return renderSyncConflictModal();
+  if (ui.modal.type === "equipmentLocations") return renderEquipmentLocationsModal();
   if (ui.modal.type === "commentTemplates") return renderCommentTemplatesModal();
   if (ui.modal.type === "equipmentGroups") return renderEquipmentGroupsModal();
   if (ui.modal.type === "equipmentForm") return renderEquipmentFormModal();
@@ -2217,6 +2786,7 @@ function bindEvents() {
 
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
     if (ui.view !== button.dataset.view) ui.expandedEquipmentIds = [];
+    if (ui.view !== button.dataset.view) { ui.equipmentSelectionMode = false; ui.selectedEquipmentIds = []; }
     ui.view = button.dataset.view;
     ui.sheet = null;
     ui.modal = null;
@@ -2588,6 +3158,8 @@ function selectStatsRangeDate(date) {
 }
 
 function bindModalEvents() {
+  bindEquipmentMoveForm();
+  document.querySelector("[data-sync-conflict-form]")?.addEventListener("submit", resolveSyncConflict);
   document.querySelectorAll("[data-close-modal]").forEach((button) => button.addEventListener("click", () => {
     ui.modal = null;
     ui.sending = false;
@@ -2600,7 +3172,9 @@ function bindModalEvents() {
   document.querySelector("[data-equipment-form]")?.addEventListener("submit", saveEquipmentFromForm);
   bindAccessModalEvents();
   bindEquipmentInstances();
+  bindEquipmentNameMatches();
   bindEquipmentGroupsForm();
+  bindEquipmentLocationsForm();
   bindCommentTemplatesForm();
   document.querySelector("[data-delete-equipment]")?.addEventListener("click", (event) => deleteEquipment(event.currentTarget.dataset.deleteEquipment));
   bindVacationPeriods();
@@ -3553,6 +4127,18 @@ function showToast(message) {
   }, 2600);
 }
 
+app.addEventListener("click", (event) => {
+  if (event.target.closest("[data-download-draft]")) downloadStateDraft();
+  if (event.target.closest("[data-retry-sync]")) saveStateToServer();
+  if (event.target.closest("[data-review-sync]") && syncConflict && !ui.modal && !ui.sheet) {
+    ui.modal = { type: "syncConflict" };
+    render();
+  }
+});
+window.setInterval(refreshSharedState, 5000);
+window.addEventListener("online", refreshSharedState);
+window.addEventListener("focus", refreshSharedState);
+
 app.addEventListener("scroll", (event) => {
   if (!event.target.classList?.contains("main")) return;
   window.clearTimeout(uiScrollTimer);
@@ -3568,6 +4154,7 @@ window.addEventListener("pagehide", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") saveUiState();
+  else refreshSharedState();
 });
 
 if ("serviceWorker" in navigator) {

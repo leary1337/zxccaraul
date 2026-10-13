@@ -1068,3 +1068,19 @@ textarea.field {
 .substitution-form[hidden] { display: none; }
 .substitution-form [hidden] { display: none; }
 .substitution-form label { display: grid; gap: 6px; }
+.equipment-location-row { margin-bottom: 14px; padding: 14px; border: 1px solid var(--border, #303743); border-radius: 14px; }
+.sync-notice { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; padding: 12px; border: 1px solid #695131; border-radius: 12px; background: #30281b; color: #ffe3a0; font-size: 13px; }
+.sync-notice[hidden] { display: none; }
+.sync-conflict-record { border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+.sync-conflict-record pre { font-family: inherit; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--surface-soft); }
+.equipment-name-matches { padding: 12px; border: 1px solid #695131; border-radius: 12px; background: #30281b; margin-bottom: 14px; }
+.equipment-name-matches[hidden] { display: none; }
+.equipment-name-match-list { display: grid; gap: 8px; }
+.equipment-name-match { display: grid; gap: 4px; text-align: left; white-space: normal; }
+.equipment-name-confirm { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; }
+.equipment-name-confirm input { flex: 0 0 20px; width: 20px; height: 20px; accent-color: var(--primary); }
+.equipment-selection-tools { display: grid; gap: 8px; margin: 0 0 14px; }
+.equipment-selection-tools > button { justify-self: start; }
+.equipment-card-top { display: flex; align-items: center; gap: 10px; }
+.equipment-card-top .equipment-card-toggle { flex: 1; min-width: 0; }
+.equipment-select-checkbox { flex: 0 0 22px; width: 22px; height: 22px; accent-color: var(--primary); margin-left: 2px; }
