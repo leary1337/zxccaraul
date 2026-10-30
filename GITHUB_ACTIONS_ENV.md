@@ -2,6 +2,20 @@
 
 Создайте в `Settings → Environments` окружения `staging` и/или `production`. Все перечисленные значения задаются внутри конкретного Environment: так один workflow может безопасно деплоить разные серверы, домены, базы и Compose projects.
 
+## Production с 30 октября 2026 года
+
+Приложение работает на отдельном сервере `191.217.231.116` (`vm345906.it-garage.network`). Публичный адрес остаётся `https://caraul.scanbet.pro`.
+
+В GitHub Environment `production` явно заданы `SERVER_HOST=191.217.231.116`, `SERVER_PORT=22`, `SERVER_USERNAME=deploy`, `SERVER_APP_PATH=/opt/caraul`, `COMPOSE_PROJECT_NAME=caraul`, `APP_PORT=5173`, `APP_STATE_ID=main`, `POSTGRES_DB=caraul` и `POSTGRES_USER=caraul`. Environment содержит отдельный `SERVER_PRIVATE_KEY` нового сервера и `POSTGRES_PASSWORD` перенесённой базы. Секрет `GHCR_PAT` наследуется из репозитория.
+
+Рабочие файлы находятся в `/opt/caraul`, данные Postgres — в volume `caraul_postgres_data`, предрелизные резервные копии — в `/opt/caraul/backups`. Порты приложения и базы наружу не публикуются: HTTPS обслуживает Nginx, приложение доступно на `127.0.0.1:5173`.
+
+Для обновления запускайте `Build and deploy zxccaraul` с `environment=production`. Не изменяйте `APP_STATE_ID` или `COMPOSE_PROJECT_NAME` при обычном обновлении: это может открыть другое состояние или другой volume. На сервере используется Docker storage driver `overlay2`, чтобы не дублировать хранение образов на небольшом системном диске.
+
+Финальная копия перед переключением: `/opt/caraul/backups/migration-final-20261030.dump` (формат `pg_dump -Fc`). Исторические резервные копии также перенесены. При сверке полностью совпали JSONB-данные обеих таблиц `app_auth` и `app_state`: три аккаунта, один караул и два сохранённых состояния, включая старое `main`.
+
+Для завершения переключения DNS в Selectel требуется запись `A caraul.scanbet.pro → 191.217.231.116`; остальные поддомены `scanbet.pro` не меняются. На время распространения DNS старый Nginx на `135.106.196.79` пересылает HTTPS и ACME-запросы на новый сервер с проверкой TLS-сертификата. Старые контейнеры `caraul-app-1` и `caraul-db-1` остановлены, volume сохранён. Не запускайте старое приложение как отдельный рабочий экземпляр: после переключения актуальные изменения находятся только в новой базе.
+
 ## Обязательные variables
 
 | Имя | Пример | Где используется | Описание |
