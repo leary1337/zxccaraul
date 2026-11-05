@@ -7,6 +7,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { mergeSharedState, sameState } from "./public/state-sync.js";
+import { isScheduleDate } from "./public/roster-history.js";
+import { validAchievement, validAchievementRules, achievementCategoryList, validAchievementCategories } from "./public/achievements.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -230,6 +232,8 @@ async function persistAuthStore() {
 }
 
 function readBody(req) {
+  // The stream decoder preserves UTF-8 letters split across network chunks.
+  req.setEncoding("utf8");
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", (chunk) => {
@@ -1113,10 +1117,16 @@ function projectAppState(value, context) {
   };
   if (["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.employees = value.employees || [];
   if (["roster.view", "stats.view"].some((permission) => hasPermission(context, permission))) projected.absences = value.absences || [];
+  if (hasPermission(context, "stats.view")) {
+    if (Object.hasOwn(value, "achievements")) projected.achievements = value.achievements;
+    if (Object.hasOwn(value, "achievementRules")) projected.achievementRules = value.achievementRules;
+    if (Object.hasOwn(value, "achievementCategories")) projected.achievementCategories = value.achievementCategories;
+  }
   if (hasPermission(context, "roster.view")) {
     projected.templateBlocks = value.templateBlocks || [];
     projected.rosterCommentTemplates = value.rosterCommentTemplates || [];
     projected.rosters = value.rosters || {};
+    if (Object.hasOwn(value, "rosterSchedule")) projected.rosterSchedule = value.rosterSchedule;
   }
   if (hasPermission(context, "work.view")) {
     projected.equipment = value.equipment || [];
@@ -1130,6 +1140,26 @@ function projectAppState(value, context) {
 function mergeAuthorizedState(previousValue, submittedValue, context) {
   const previous = previousValue && typeof previousValue === "object" ? previousValue : {};
   const submitted = submittedValue && typeof submittedValue === "object" ? submittedValue : {};
+  if (Object.hasOwn(submitted, "rosterSchedule") && (!submitted.rosterSchedule || typeof submitted.rosterSchedule.enabled !== "boolean" || !isScheduleDate(submitted.rosterSchedule.anchorDate))) {
+    return { error: "Укажите корректную дату дежурства для графика смен." };
+  }
+  if (Object.hasOwn(submitted, "achievements") && (!Array.isArray(submitted.achievements) || !submitted.achievements.every(validAchievement) || new Set(submitted.achievements.map((entry) => entry.id)).size !== submitted.achievements.length)) {
+    return { error: "Проверьте записи об участии: нужны дата, название, участники и целое число баллов от 0 до 2000. Для особого вклада добавьте пояснение." };
+  }
+  if (Object.hasOwn(submitted, "achievementRules") && !validAchievementRules(submitted.achievementRules)) {
+    return { error: "Баллы по правилам должны быть целыми числами от 0 до 1000." };
+  }
+  if (Object.hasOwn(submitted, "achievementCategories") && !validAchievementCategories(submitted.achievementCategories)) {
+    return { error: "Виды участия: укажите разные названия, целые баллы от 0 до 1000 и оставьте хотя бы один действующий вид." };
+  }
+  const categories = achievementCategoryList({ ...previous, ...submitted });
+  for (const entry of submitted.achievements || []) {
+    const before = previous.achievements?.find((item) => item.id === entry.id);
+    if (sameState(before, entry)) continue;
+    const category = categories.find((item) => item.id === entry.type);
+    if (!category || (category.archived && before?.type !== entry.type)) return { error: "Этот вид участия убран из выбора. Выберите действующий вид участия." };
+    if (category.requireComment && !entry.comment.trim()) return { error: "Этот вид участия требует пояснения к записи." };
+  }
   const visiblePrevious = projectAppState(previous, context) || {};
   const merged = { ...previous };
   const sections = [
@@ -1137,13 +1167,16 @@ function mergeAuthorizedState(previousValue, submittedValue, context) {
     { keys: ["employees"], edit: "employees.edit", view: ["employees.view", "roster.view", "stats.view"].some((permission) => hasPermission(context, permission)) },
     { keys: ["equipment", "equipmentGroups", "equipmentGroupsConfigured", "equipmentLocations"], edit: "work.edit", view: hasPermission(context, "work.view") },
     { keys: ["absences"], edit: "roster.edit", view: hasPermission(context, "roster.view") || hasPermission(context, "stats.view") },
-    { keys: ["templateBlocks", "rosters", "rosterCommentTemplates"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
+    { keys: ["achievements"], edit: "roster.edit", view: hasPermission(context, "stats.view"), requireView: true },
+    { keys: ["achievementRules"], edit: "guard.manage", view: hasPermission(context, "stats.view"), requireView: true },
+    { keys: ["achievementCategories"], edit: "guard.manage", view: hasPermission(context, "stats.view"), requireView: true },
+    { keys: ["templateBlocks", "rosters", "rosterCommentTemplates", "rosterSchedule"], edit: "roster.edit", view: hasPermission(context, "roster.view") }
   ];
   for (const section of sections) {
     for (const key of section.keys) {
-      if (hasPermission(context, section.edit)) {
+      if (hasPermission(context, section.edit) && (!section.requireView || section.view)) {
         if (Object.hasOwn(submitted, key)) merged[key] = submitted[key];
-      } else if (section.view && !(key === "equipmentGroups" ? sameState(Object.entries(submitted[key] || {}), Object.entries(visiblePrevious[key] || {})) : sameState(submitted[key], visiblePrevious[key]))) {
+      } else if ((section.view || section.requireView) && !(key === "equipmentGroups" ? sameState(Object.entries(submitted[key] || {}), Object.entries(visiblePrevious[key] || {})) : sameState(submitted[key], visiblePrevious[key]))) {
         return { error: `Недостаточно прав: ${permissionCatalog[section.edit]}` };
       }
     }
@@ -1190,7 +1223,9 @@ function prepareSharedUpdate(previous, payload, context) {
   const final = mergeAuthorizedState(previous, merged.state, context);
   if (final.error) {
     // Related records can conflict even when their IDs differ (e.g. deleting a used location).
-    const conflicts = ["equipment", "equipmentLocations", "equipmentGroups"].map((field) => ({ key: JSON.stringify([field]), path: [field], label: field === "equipment" ? "Оборудование" : field === "equipmentLocations" ? "Места хранения" : "Разделы оборудования", base: base[field], local: merged.state[field], remote: visible?.[field] }));
+    const fields = /вид(?:ы)? участия/iu.test(final.error) ? ["achievements", "achievementCategories"] : ["equipment", "equipmentLocations", "equipmentGroups"];
+    const labels = { equipment: "Оборудование", equipmentLocations: "Места хранения", equipmentGroups: "Разделы оборудования", achievements: "Участие и поощрения", achievementCategories: "Виды участия" };
+    const conflicts = fields.map((field) => ({ key: JSON.stringify([field]), path: [field], label: labels[field], base: base[field], local: merged.state[field], remote: visible?.[field] }));
     return { status: 409, code: "edit_conflict", error: final.error, state: visible, conflicts };
   }
   return { data: final.state };

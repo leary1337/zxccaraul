@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node server.mjs",
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check public/state-sync.js && node --check public/equipment-name-match.js",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/state-sync.js && node --check public/equipment-name-match.js && node --check public/roster-history.js && node --check public/achievements.js",
     "test": "node --test tests/*.test.mjs"
   },
   "optionalDependencies": {

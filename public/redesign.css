@@ -1084,3 +1084,44 @@ textarea.field {
 .equipment-card-top { display: flex; align-items: center; gap: 10px; }
 .equipment-card-top .equipment-card-toggle { flex: 1; min-width: 0; }
 .equipment-select-checkbox { flex: 0 0 22px; width: 22px; height: 22px; accent-color: var(--primary); margin-left: 2px; }
+.roster-actions { margin-bottom: 14px; }
+.roster-actions > summary { display: inline-flex; align-items: center; gap: 14px; list-style: none; cursor: pointer; }
+.roster-actions > summary::-webkit-details-marker { display: none; }
+.roster-actions[open] > summary span { transform: rotate(180deg); }
+.roster-actions-list { display: grid; gap: 8px; padding: 12px; margin-top: 8px; max-width: 360px; border: 1px solid var(--border, #303743); border-radius: 14px; background: var(--surface, #191d24); }
+.roster-actions-list > button { width: 100%; text-align: left; }
+.calendar-day:disabled { opacity: .24; cursor: default; }
+.schedule-toggle { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 20px; }
+.schedule-toggle input { flex: 0 0 20px; width: 20px; height: 20px; accent-color: var(--primary); }
+.schedule-toggle[hidden] { display: none; }
+.stats-sections { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.stats-sections [aria-pressed="true"] { border-color: var(--primary, #ff593e); background: #402723; color: #ffad9d; }
+.achievement-filters { display: grid; gap: 12px; }
+.achievement-section-title { margin: 22px 0 12px; font-size: 20px; }
+.achievement-standings, .achievement-journal { display: grid; gap: 10px; }
+.achievement-person > summary { display: flex; align-items: center; gap: 12px; padding: 16px; list-style: none; cursor: pointer; }
+.achievement-person > summary::-webkit-details-marker { display: none; }
+.achievement-rank { min-width: 25px; color: var(--muted); font-weight: 700; }
+.achievement-person-name { display: grid; gap: 5px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.achievement-person-name small { font-size: 12px; }
+.achievement-total { white-space: nowrap; color: #ffd18d; }
+.achievement-detail { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid var(--border, #303743); }
+.achievement-detail p { margin: 0; white-space: pre-wrap; }
+.achievement-comment { white-space: pre-wrap; }
+.achievement-journal h3 { margin: 8px 0; overflow-wrap: anywhere; }
+.achievement-participants { border: 1px solid var(--border, #303743); border-radius: 12px; padding: 12px; margin: 12px 0; }
+.achievement-checkboxes { max-height: 230px; overflow-y: auto; display: grid; gap: 6px; }
+.achievement-checkboxes label { display: flex; align-items: center; gap: 10px; min-height: 42px; }
+.achievement-checkboxes input { flex: 0 0 22px; width: 22px; height: 22px; accent-color: var(--primary); }
+.achievement-category-row { margin-bottom: 14px; padding: 14px; border: 1px solid var(--border, #303743); border-radius: 14px; }
+.achievement-category-row h3 { margin: 0 0 14px; }
+.achievement-category-row[data-archived="true"] { background: #15191f; }
+.achievement-category-row small { color: var(--muted); }
+button.stat-metric { position: relative; width: 100%; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+button.stat-metric:focus-visible, .stat-table-link:focus-visible { outline: 2px solid var(--primary, #ff593e); outline-offset: 2px; }
+button.stat-metric:hover { border-color: var(--primary, #ff593e); }
+.stat-metric-more { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 22px; }
+.stat-table-link { min-width: 44px; min-height: 44px; border: 0; border-radius: 8px; color: inherit; font: inherit; background: var(--surface-soft); cursor: pointer; }
+.stat-absence-total { margin: 12px 0 16px; }
+.stat-absence-dates { display: grid; gap: 10px; }
+.stat-absence-date { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; padding: 14px; border: 1px solid var(--border, #303743); border-radius: 12px; }

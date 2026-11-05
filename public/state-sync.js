@@ -8,8 +8,8 @@ export function sameState(a, b) {
     ? sameState(Object.entries(a[key] || {}), Object.entries(b[key] || {})) : sameState(a[key], b[key])));
 }
 
-const collections = new Set(["equipment", "employees", "absences", "equipmentLocations", "rosterCommentTemplates"]);
-const labels = { equipment: "Оборудование", employees: "Сотрудник", absences: "Отсутствие", equipmentLocations: "Место хранения", rosterCommentTemplates: "Шаблон", rosters: "Раскладка", equipmentGroups: "Разделы оборудования", appTitle: "Название караула", templateBlocks: "Блоки раскладки" };
+const collections = new Set(["equipment", "employees", "absences", "equipmentLocations", "rosterCommentTemplates", "achievements", "achievementCategories"]);
+const labels = { equipment: "Оборудование", employees: "Сотрудник", absences: "Отсутствие", equipmentLocations: "Место хранения", rosterCommentTemplates: "Шаблон", rosters: "Раскладка", equipmentGroups: "Разделы оборудования", appTitle: "Название караула", templateBlocks: "Блоки раскладки", rosterSchedule: "График смен", achievements: "Участие и поощрения", achievementRules: "Правила баллов", achievementCategories: "Виды участия" };
 
 export function mergeSharedState(base = {}, local = {}, remote = {}, choices = {}) {
   base ||= {}; local ||= {}; remote ||= {};

@@ -1,5 +1,7 @@
 import { mergeSharedState, sameState } from "./state-sync.js";
 import { findEquipmentNameMatches, parseEquipmentAliases } from "./equipment-name-match.js";
+import { isReserveDriverTitle, previousFilledRoster, copyRosterBlocks, scheduleEnabled, isDutyDate, nearestDutyDate } from "./roster-history.js";
+import { achievementTypes, defaultAchievementRules, achievementPoints, validAchievement, validAchievementRules, achievementStandings, achievementCategoryList, validAchievementCategories } from "./achievements.js";
 
 const STORAGE_KEY = "caraul-state-v2";
 const LEGACY_MIGRATION_KEY = "caraul-state-server-migrated-v1";
@@ -144,6 +146,10 @@ let ui = {
   modal: null,
   toast: "",
   stats: {
+    section: "absences",
+    rewardYear: new Date().getFullYear(),
+    rewardType: "",
+    rewardSearch: "",
     from: `${new Date().getFullYear()}-01-01`,
     to: `${new Date().getFullYear()}-12-31`,
     absenceType: "",
@@ -166,7 +172,8 @@ let ui = {
   accessExpandedRoleId: "",
   sending: false,
   renderedPng: "",
-  pngStatus: ""
+  pngStatus: "",
+  rosterActionsOpen: false
 };
 let savedUiScroll = { view: "", group: "", top: 0, left: 0 };
 let uiScrollTimer = 0;
@@ -188,6 +195,10 @@ function restoreUiState() {
     if (typeof saved.equipmentLocation === "string") ui.equipmentLocation = saved.equipmentLocation;
     const stats = saved.stats;
     if (stats && typeof stats === "object") {
+      if (["absences", "achievements"].includes(stats.section)) ui.stats.section = stats.section;
+      if (Number.isInteger(stats.rewardYear) && stats.rewardYear >= 1900 && stats.rewardYear <= 9999) ui.stats.rewardYear = stats.rewardYear;
+      if (typeof stats.rewardType === "string") ui.stats.rewardType = stats.rewardType;
+      if (typeof stats.rewardSearch === "string") ui.stats.rewardSearch = stats.rewardSearch;
       for (const key of ["from", "to"]) if (validDate(stats[key])) ui.stats[key] = stats[key];
       if (typeof stats.search === "string") ui.stats.search = stats.search;
       if (typeof stats.onlyWithAbsences === "boolean") ui.stats.onlyWithAbsences = stats.onlyWithAbsences;
@@ -402,7 +413,7 @@ async function saveStateToServer(keepalive = false) {
   const editVersion = syncEditVersion;
   const sent = copyState(state);
   const base = copyState(syncBase);
-  const editable = { appTitle: "guard.manage", employees: "employees.edit", equipment: "work.edit", equipmentGroups: "work.edit", equipmentGroupsConfigured: "work.edit", equipmentLocations: "work.edit", absences: "roster.edit", rosters: "roster.edit", templateBlocks: "roster.edit", rosterCommentTemplates: "roster.edit" };
+  const editable = { appTitle: "guard.manage", employees: "employees.edit", equipment: "work.edit", equipmentGroups: "work.edit", equipmentGroupsConfigured: "work.edit", equipmentLocations: "work.edit", absences: "roster.edit", rosters: "roster.edit", templateBlocks: "roster.edit", rosterCommentTemplates: "roster.edit", rosterSchedule: "roster.edit", achievements: "roster.edit", achievementRules: "guard.manage", achievementCategories: "guard.manage" };
   for (const [field, permission] of Object.entries(editable)) if (!can(permission)) {
     if (base && Object.hasOwn(base, field)) sent[field] = copyState(base[field]);
     else delete sent[field];
@@ -824,11 +835,13 @@ function renderCurrentView() {
 function getRoster(date = ui.selectedDate) {
   if (state.rosters[date]) return normalizeRoster(state.rosters[date]);
   const now = new Date().toISOString();
-  const blocks = templateBlocksForDate(date);
+  const previous = previousRosterForDate(date);
+  const blocks = previous ? copyPreviousRosterBlocks(previous, date) : templateBlocksForDate(date);
   const roster = {
     id: `roster-${date}`,
     date,
     blocks,
+    copiedFromDate: previous?.date || "",
     comment: scheduledRosterComment(date),
     status: "draft",
     version: 1,
@@ -843,14 +856,24 @@ function getRoster(date = ui.selectedDate) {
   return normalizeRoster(state.rosters[date]);
 }
 
+function previousRosterForDate(targetDate) {
+  // Normalize legacy records before choosing a source, without borrowing a future date.
+  const candidates = Object.values(state.rosters || {})
+    .filter((roster) => roster?.date < targetDate)
+    .map((roster) => normalizeRoster(copyState(roster)));
+  return previousFilledRoster(candidates, targetDate);
+}
+
+function copyPreviousRosterBlocks(source, date) {
+  return copyRosterBlocks(source, state.employees, state.absences, date, () => createId("block"));
+}
+
 function lastRosterTemplate(targetDate) {
   const candidates = Object.values(state.rosters || {})
-    .filter((roster) => roster?.date !== targetDate)
-    .map((roster) => normalizeRoster(roster))
+    .filter((roster) => roster?.date < targetDate)
+    .map((roster) => normalizeRoster(copyState(roster)))
     .filter((roster) => roster.blocks.length)
     .sort((a, b) => {
-      const updated = String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
-      if (updated) return updated;
       return String(b.date || "").localeCompare(String(a.date || ""));
     });
 
@@ -886,7 +909,7 @@ function instantiateTemplateBlocks(template, existingBlocks = []) {
   });
 }
 
-function applyCurrentTemplateToFutureDates() {
+function saveCurrentRosterTemplate() {
   const source = getRoster();
   const template = currentRosterTemplate(source);
   if (!template.length) return 0;
@@ -895,21 +918,11 @@ function applyCurrentTemplateToFutureDates() {
   state.templateBlocks = normalizeTemplateBlocks(template);
   source.updatedAt = now;
 
-  let changed = 0;
-  Object.entries(state.rosters || {}).forEach(([date, roster]) => {
-    if (date <= ui.selectedDate) return;
-    normalizeRoster(roster);
-    const nextBlocks = instantiateTemplateBlocks(template, roster.blocks);
-    if (JSON.stringify(roster.blocks) === JSON.stringify(nextBlocks)) return;
-    roster.blocks = nextBlocks;
-    roster.updatedAt = now;
-    changed += 1;
-  });
   persist();
-  return changed;
 }
 
 function renderRosterView() {
+  ui.selectedDate = nearestDutyDate(ui.selectedDate, state.rosterSchedule);
   const roster = getRoster();
   const activeEmployeeIds = new Set(state.employees.filter((employee) => employee.isActive).map((employee) => employee.id));
   const assignedEmployeeIds = new Set(allAssignments(roster).map((item) => item.employeeId).filter((id) => activeEmployeeIds.has(id)));
@@ -926,13 +939,13 @@ function renderRosterView() {
         <h1>Раскладка</h1>
         <p class="muted">Состав караула на выбранную дату</p>
       </div>
-      <button class="ghost-btn" data-today type="button">Сегодня</button>
+      <button class="ghost-btn" data-today type="button">${scheduleEnabled(state.rosterSchedule) ? "Ближайшая смена" : "Сегодня"}</button>
     </div>
 
     <div class="datebar">
-      <button class="icon-btn" data-date-step="-1" type="button" aria-label="Предыдущий день">‹</button>
+      <button class="icon-btn" data-date-step="-1" type="button" aria-label="${scheduleEnabled(state.rosterSchedule) ? "Предыдущая смена" : "Предыдущий день"}">‹</button>
       <button class="date-display" data-open-calendar type="button">${formatLongDate(ui.selectedDate)}</button>
-      <button class="icon-btn" data-date-step="1" type="button" aria-label="Следующий день">›</button>
+      <button class="icon-btn" data-date-step="1" type="button" aria-label="${scheduleEnabled(state.rosterSchedule) ? "Следующая смена" : "Следующий день"}">›</button>
     </div>
 
     <div class="roster-summary" aria-label="Сводка по раскладке">
@@ -941,7 +954,17 @@ function renderRosterView() {
       <div><strong>${availableCount}</strong><span>Свободны</span></div>
     </div>
 
-    ${can("roster.edit") ? `<div class="toolbar"><button class="btn" data-add-block type="button">Добавить блок</button></div>` : ""}
+    ${can("roster.edit") ? `<details class="roster-actions" data-roster-actions ${ui.rosterActionsOpen ? "open" : ""}>
+      <summary class="ghost-btn">Действия <span aria-hidden="true">⌄</span></summary>
+      <div class="roster-actions-list">
+      <button class="btn" data-add-block type="button">Добавить блок</button>
+      <button class="ghost-btn" data-copy-previous-roster type="button" ${previousFilledRoster(state.rosters, ui.selectedDate) ? "" : "disabled"}>Из прошлой смены</button>
+      <button class="ghost-btn" data-reset-roster-assignments type="button" ${allAssignments(roster).length ? "" : "disabled"}>Сбросить назначения</button>
+      <button class="ghost-btn" data-roster-schedule type="button">График смен${scheduleEnabled(state.rosterSchedule) ? ": сутки через трое" : ""}</button>
+      </div>
+    </details>` : ""}
+    ${scheduleEnabled(state.rosterSchedule) ? `<p class="muted small">Сутки через трое · показаны даты вашего караула.</p>` : ""}
+    ${roster.copiedFromDate ? `<p class="muted small">Назначения из раскладки за ${formatShortDate(roster.copiedFromDate)}. Проверьте состав. Резервного водителя выберите отдельно.</p>` : ""}
 
     <section class="dashboard-grid">
       ${roster.blocks.map((block) => renderCustomBlockPanel(block)).join("") || renderEmptyBlocksPanel()}
@@ -1121,6 +1144,7 @@ function renderOthersPanel(roster) {
 }
 
 function renderStatsView() {
+  if (ui.stats.section === "achievements") return renderAchievementsView();
   const rows = calculateStats();
   const statColumns = [
     ["dayOff", "Отгулы"],
@@ -1134,6 +1158,7 @@ function renderStatsView() {
       </div>
     </div>
 
+    ${renderStatsSections()}
     <section class="panel" style="margin-bottom:12px">
       <div class="panel-body">
         <div class="filters stats-filters">
@@ -1162,13 +1187,95 @@ function renderStatsView() {
           ${rows.map((row) => `
             <tr>
               <td>${escapeHtml(row.employee.shortName)}</td>
-              ${statColumns.map(([key]) => `<td>${row[key]}</td>`).join("")}
+              ${statColumns.map(([key, label]) => `<td><button class="stat-table-link" data-stat-absence="${key}" data-stat-employee="${escapeAttr(row.employee.id)}" aria-label="${escapeAttr(`${label}: ${row.employee.shortName}, дней: ${row[key]}`)}" type="button">${row[key]}</button></td>`).join("")}
             </tr>
           `).join("") || `<tr><td colspan="${statColumns.length + 1}">Нет данных за выбранный период</td></tr>`}
         </tbody>
       </table>
     </div>
   `;
+}
+
+function renderStatsSections() {
+  return `<div class="stats-sections" role="group" aria-label="Раздел статистики">
+    <button class="ghost-btn" data-stats-section="absences" aria-pressed="${ui.stats.section !== "achievements"}" type="button">Отсутствия</button>
+    <button class="ghost-btn" data-stats-section="achievements" aria-pressed="${ui.stats.section === "achievements"}" type="button">Участие и поощрения</button>
+  </div>`;
+}
+
+function achievementList() { return Array.isArray(state.achievements) ? state.achievements : []; }
+function currentAchievementRules() { return { ...defaultAchievementRules, ...state.achievementRules }; }
+function currentAchievementCategories() { return achievementCategoryList(state); }
+function achievementCategoryName(id, fallback = "") { return currentAchievementCategories().find((item) => item.id === id)?.name || fallback || achievementTypes[id] || "Вид участия из старой записи"; }
+function achievementFilterCategories() {
+  const categories = currentAchievementCategories().map((item) => ({ ...item }));
+  achievementList().forEach((entry) => {
+    if (!categories.some((item) => item.id === entry.type)) categories.push({ id: entry.type, name: achievementCategoryName(entry.type, entry.typeName), archived: true });
+  });
+  return categories;
+}
+function achievementFormCategories(entry) {
+  const categories = currentAchievementCategories().filter((item) => !item.archived || item.id === entry?.type);
+  if (entry && !categories.some((item) => item.id === entry.type)) categories.push({ id: entry.type, name: achievementCategoryName(entry.type, entry.typeName), points: entry.points, prizeBonus: 0, requireComment: Boolean(entry.commentRequired), archived: true });
+  return categories;
+}
+
+function renderAchievementsView() {
+  const entries = achievementList();
+  const years = [...new Set([new Date().getFullYear(), new Date().getFullYear() - 1, ui.stats.rewardYear, ...entries.map((entry) => Number(entry.date.slice(0, 4)))])].sort((a, b) => b - a);
+  const query = ui.stats.rewardSearch.trim().toLocaleLowerCase("ru");
+  const rows = achievementStandings(entries, state.employees, ui.stats.rewardYear, ui.stats.rewardType).filter((row) => !query || row.name.toLocaleLowerCase("ru").includes(query));
+  const events = entries.filter((entry) => entry.date.slice(0, 4) === String(ui.stats.rewardYear) && (!ui.stats.rewardType || entry.type === ui.stats.rewardType) && (!query || `${entry.title} ${entry.participants.map((person) => person.name).join(" ")}`.toLocaleLowerCase("ru").includes(query))).sort((a, b) => b.date.localeCompare(a.date));
+  const rules = currentAchievementRules();
+  return `<div class="page-title"><div><h1>Статистика</h1><p class="muted">Участие и поощрения за ${ui.stats.rewardYear} год</p></div></div>
+    ${renderStatsSections()}
+    <div class="toolbar">${can("roster.edit") ? '<button class="btn" data-achievement-add type="button">+ Добавить запись</button>' : ""}${can("guard.manage") ? '<button class="ghost-btn" data-achievement-rules type="button">Виды участия</button>' : ""}</div>
+    <section class="panel"><div class="panel-body achievement-filters">
+      <div class="field-group"><label for="achievement-year">Год</label><select class="field" id="achievement-year" data-achievement-year>${years.map((year) => `<option ${year === ui.stats.rewardYear ? "selected" : ""}>${year}</option>`).join("")}</select></div>
+      <div class="field-group"><label for="achievement-filter">Что учитываем</label><select class="field" id="achievement-filter" data-achievement-filter><option value="">Всё участие</option>${achievementFilterCategories().map((item) => `<option value="${escapeAttr(item.id)}" ${ui.stats.rewardType === item.id ? "selected" : ""}>${escapeHtml(item.name)}${item.archived ? " (архив)" : ""}</option>`).join("")}</select></div>
+      <input class="field" data-achievement-search aria-label="Поиск в поощрениях" placeholder="Фамилия или мероприятие" value="${escapeAttr(ui.stats.rewardSearch)}" />
+    </div></section>
+    <p class="muted small">Баллы начисляются каждому участнику по выбранному виду участия. Одинаковые баллы дают одинаковое место. Изменение настроек не меняет старые начисления.</p>
+    <h2 class="achievement-section-title">Итоги года</h2>
+    <div class="achievement-standings">${rows.map((row) => `<details class="panel achievement-person" data-achievement-person="${escapeAttr(row.id)}"><summary><span class="achievement-rank">${row.rank || "—"}</span><span class="achievement-person-name"><strong>${escapeHtml(row.name)}</strong><small class="muted">Записей: ${row.entries.length}${row.active ? "" : " · архив"}</small></span><strong class="achievement-total">${row.points} б.</strong><span aria-hidden="true">⌄</span></summary><div class="panel-body">${row.entries.map((entry) => `<div class="achievement-detail"><span class="muted small">${formatShortDate(entry.date)} · ${escapeHtml(achievementCategoryName(entry.type, entry.typeName))}</span><strong>${escapeHtml(entry.title)} · +${entry.points} б.</strong>${entry.comment ? `<p>${escapeHtml(entry.comment)}</p>` : ""}</div>`).join("") || '<p class="muted">Участие за этот год пока не отмечено.</p>'}</div></details>`).join("") || '<div class="empty-state">Сотрудники не найдены.</div>'}</div>
+    <h2 class="achievement-section-title">Журнал участия</h2>
+    <div class="achievement-journal">${events.map((entry) => `<article class="panel"><div class="panel-body"><div class="muted small">${formatShortDate(entry.date)} · ${escapeHtml(achievementCategoryName(entry.type, entry.typeName))}</div><h3>${escapeHtml(entry.title)}</h3><p>${entry.participants.map((person) => escapeHtml(person.name)).join(", ")}</p><strong>+${entry.points} б. каждому${entry.prize ? " · дополнительное поощрение" : ""}</strong>${entry.comment ? `<p class="achievement-comment">${escapeHtml(entry.comment)}</p>` : ""}${can("roster.edit") ? `<div class="actions"><button class="ghost-btn" data-achievement-edit="${escapeAttr(entry.id)}" type="button">Изменить</button><button class="danger-btn" data-achievement-delete="${escapeAttr(entry.id)}" type="button">Удалить</button></div>` : ""}</div></article>`).join("") || '<div class="empty-state">Записей за этот год пока нет. Отметьте участие сотрудников в соревнованиях или работах.</div>'}</div>`;
+}
+
+function renderAchievementForm() {
+  const entry = achievementList().find((item) => item.id === ui.modal.id);
+  const selected = new Map((entry?.participants || []).map((person) => [person.employeeId, person.name]));
+  const participants = new Map(state.employees.filter((person) => person.isActive || selected.has(person.id)).map((person) => [person.id, person.shortName]));
+  selected.forEach((name, id) => { if (!participants.has(id)) participants.set(id, name); });
+  const categories = achievementFormCategories(entry);
+  const type = entry?.type || categories[0]?.id || "competition";
+  const category = categories.find((item) => item.id === type);
+  return `<div class="modal-backdrop"><form class="modal" data-achievement-form data-entry-id="${escapeAttr(entry?.id || "")}"><div class="modal-head"><h2>${entry ? "Изменить запись" : "Отметить участие"}</h2><button class="icon-btn" data-close-modal aria-label="Закрыть" type="button">×</button></div><div class="modal-body">
+    <div class="field-group"><label for="achievement-date">Дата</label><input class="field" id="achievement-date" name="date" type="date" required value="${escapeAttr(entry?.date || isoDate(new Date()))}" /></div>
+    <div class="field-group"><label for="achievement-title">Мероприятие или выполненная работа</label><input class="field" id="achievement-title" name="title" maxlength="160" required value="${escapeAttr(entry?.title || "")}" placeholder="Например: соревнования по ГДЗС" /></div>
+    <div class="field-group"><label for="achievement-type">Вид участия</label><select class="field" id="achievement-type" name="type">${categories.map((item) => `<option value="${escapeAttr(item.id)}" ${type === item.id ? "selected" : ""}>${escapeHtml(item.name)}${item.archived ? " (архив)" : ""}</option>`).join("")}</select></div>
+    <label class="schedule-toggle" data-prize-label ${category?.prizeBonus > 0 ? "" : "hidden"}><input type="checkbox" name="prize" ${entry?.prize ? "checked" : ""} /> Дополнительное поощрение</label>
+    <div class="field-group"><label for="achievement-points">Баллы каждому участнику</label><input class="field" id="achievement-points" name="points" type="number" min="0" max="2000" step="1" required value="${entry?.points ?? achievementPoints(type, false, currentAchievementRules(), categories)}" /><p class="muted small">Подставляются по правилам. Можно изменить для этой записи.</p></div>
+    <fieldset class="achievement-participants"><legend>Участники</legend><div class="achievement-checkboxes">${[...participants].sort((a, b) => a[1].localeCompare(b[1], "ru")).map(([id, name]) => `<label><input type="checkbox" name="participant" value="${escapeAttr(id)}" data-person-name="${escapeAttr(name)}" ${selected.has(id) ? "checked" : ""} /><span>${escapeHtml(name)}</span></label>`).join("") || '<p class="muted">Сначала добавьте сотрудников в справочник.</p>'}</div></fieldset>
+    <div class="field-group"><label for="achievement-comment">Пояснение${category?.requireComment ? " (обязательно)" : ""}</label><textarea class="field" id="achievement-comment" name="comment" maxlength="1000" ${category?.requireComment ? "required" : ""} placeholder="Результат, место или за что отмечаем сотрудника">${escapeHtml(entry?.comment || "")}</textarea></div>
+    <p class="form-error" data-achievement-error hidden></p><div class="actions"><button class="btn" type="submit">Сохранить</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div>
+  </div></form></div>`;
+}
+
+function renderAchievementCategoryRow(category, saved = true) {
+  const id = escapeAttr(category.id);
+  return `<section class="achievement-category-row" data-category-row data-category-id="${id}" data-saved="${saved}" data-archived="${category.archived}">
+    <h3>${escapeHtml(category.name || "Новый вид участия")} <small data-category-status>${category.archived ? "(архив)" : ""}</small></h3>
+    <div class="field-group"><label for="category-name-${id}">Название вида</label><input class="field" id="category-name-${id}" name="categoryName" maxlength="80" required value="${escapeAttr(category.name)}" placeholder="Например: занятия со школьниками" /></div>
+    <div class="field-group"><label for="category-points-${id}">Баллы каждому участнику</label><input class="field" id="category-points-${id}" name="categoryPoints" type="number" min="0" max="1000" required value="${category.points}" /></div>
+    <div class="field-group"><label for="category-bonus-${id}">Дополнительные баллы за поощрение</label><input class="field" id="category-bonus-${id}" name="categoryBonus" type="number" min="0" max="1000" required value="${category.prizeBonus}" /><small class="muted">Оставьте 0, если доплата баллами не нужна.</small></div>
+    <label class="schedule-toggle"><input type="checkbox" name="categoryComment" ${category.requireComment ? "checked" : ""} /> Обязательное пояснение к записи</label>
+    <button class="${category.archived ? "ghost-btn" : "danger-btn"}" data-toggle-category type="button">${category.archived ? "Вернуть в выбор" : saved ? "Убрать из выбора" : "Удалить новый вид"}</button>
+  </section>`;
+}
+
+function renderAchievementRules() {
+  return `<div class="modal-backdrop"><form class="modal" data-achievement-rules-form><div class="modal-head"><h2>Виды участия и баллы</h2><button class="icon-btn" data-close-modal aria-label="Закрыть" type="button">×</button></div><div class="modal-body"><p class="muted small">Создавайте свои виды участия и задавайте баллы каждому участнику. Убранные виды останутся в истории. Изменение баллов действует только на новые записи.</p><div data-category-rows>${currentAchievementCategories().map((item) => renderAchievementCategoryRow(item)).join("")}</div><p class="form-error" data-category-error hidden></p><div class="actions"><button class="ghost-btn" data-category-add type="button">+ Добавить вид участия</button><button class="btn" type="submit">Сохранить</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div></div></form></div>`;
 }
 
 function renderStatPersonCard(row, columns) {
@@ -1182,10 +1289,11 @@ function renderStatPersonCard(row, columns) {
       </span>
       <span class="stat-metrics">
         ${columns.map(([key, label]) => `
-          <span class="stat-metric">
+          <button class="stat-metric" data-stat-absence="${key}" data-stat-employee="${escapeAttr(row.employee.id)}" aria-label="${escapeAttr(`${label}: ${row.employee.shortName}, дней: ${row[key]}`)}" type="button">
             <strong>${row[key]}</strong>
             <small>${label}</small>
-          </span>
+            <span class="stat-metric-more" aria-hidden="true">›</span>
+          </button>
         `).join("")}
       </span>
     </article>
@@ -2166,11 +2274,35 @@ function deleteEquipment(id) {
 }
 
 function renderSheet() {
+  if (ui.sheet.type === "statAbsences") return renderStatAbsencesSheet();
   if (ui.sheet.type === "calendar") return renderCalendarSheet();
   if (ui.sheet.type === "statsRange") return renderStatsRangeSheet();
   if (ui.sheet.type === "employeePicker") return renderEmployeePickerSheet();
   if (ui.sheet.type === "statusPicker") return renderStatusPickerSheet();
   return "";
+}
+
+function statAbsencePeriods(employeeId, absenceType, period = statsPeriod()) {
+  return state.absences
+    .filter((absence) => absence.employeeId === employeeId && absence.absenceType === absenceType)
+    .map((absence) => ({ from: absence.dateFrom > period.from ? absence.dateFrom : period.from, to: absence.dateTo < period.to ? absence.dateTo : period.to }))
+    .filter((item) => item.from <= item.to)
+    .map((item) => ({ ...item, days: overlapDays(item.from, item.to, period.from, period.to) }))
+    .sort((a, b) => b.from.localeCompare(a.from) || b.to.localeCompare(a.to));
+}
+
+function renderStatAbsencesSheet() {
+  const { employeeId, absenceType, period } = ui.sheet;
+  const employee = findEmployee(employeeId);
+  const title = absenceType === "DAY_OFF" ? "Отгулы" : "Больничные";
+  const periods = statAbsencePeriods(employeeId, absenceType, period);
+  const total = periods.reduce((sum, item) => sum + item.days, 0);
+  return `<div class="sheet-backdrop" data-close-sheet><section class="sheet" data-stop data-stat-absence-sheet role="dialog" aria-modal="true" aria-labelledby="stat-absence-title">
+    <div class="sheet-head"><div><h2 id="stat-absence-title">${title}</h2><div class="muted small">${escapeHtml(employee?.shortName || "Сотрудник")}</div></div><button class="icon-btn" data-close-sheet type="button" aria-label="Закрыть">×</button></div>
+    <div class="sheet-body"><p class="muted small">${formatShortDate(period.from)} — ${formatShortDate(period.to)}</p>
+      <p class="stat-absence-total">Всего дней: <strong>${total}</strong></p>
+      <div class="stat-absence-dates">${periods.map((item) => `<div class="stat-absence-date"><strong>${item.from === item.to ? formatShortDate(item.from) : `${formatShortDate(item.from)} — ${formatShortDate(item.to)}`}</strong><small class="muted">Дней: ${item.days}</small></div>`).join("") || `<div class="empty-state">За выбранный период ${absenceType === "DAY_OFF" ? "отгулов" : "больничных"} нет.</div>`}</div>
+    </div></section></div>`;
 }
 
 function renderCalendarSheet() {
@@ -2206,14 +2338,14 @@ function renderCalendarSheet() {
           </div>
           <div class="calendar-grid">
             ${cells.map((date) => date ? `
-              <button class="calendar-day ${date === ui.selectedDate ? "selected" : ""} ${date === today ? "today" : ""}" data-select-date="${date}" type="button">
+              <button class="calendar-day ${date === ui.selectedDate ? "selected" : ""} ${date === today ? "today" : ""}" data-select-date="${date}" type="button" ${isDutyDate(date, state.rosterSchedule) ? "" : 'disabled aria-label="Выходной караула"'}>
                 ${parseIsoDate(date).getDate()}
               </button>
             ` : `<span class="calendar-empty"></span>`).join("")}
           </div>
           <div class="actions" style="margin-top:14px">
-            <button class="ghost-btn" data-calendar-today type="button">Сегодня</button>
-            <button class="ghost-btn" data-calendar-tomorrow type="button">Завтра</button>
+            <button class="ghost-btn" data-calendar-today type="button">${scheduleEnabled(state.rosterSchedule) ? "Ближайшая смена" : "Сегодня"}</button>
+            ${scheduleEnabled(state.rosterSchedule) ? "" : '<button class="ghost-btn" data-calendar-tomorrow type="button">Завтра</button>'}
           </div>
         </div>
       </section>
@@ -2457,8 +2589,11 @@ function describeSyncValue(value) {
   if (Array.isArray(value)) return value.map((item, index) => `${index + 1}. ${describeSyncValue(item)}`).join("\n");
   const labels = { name: "Название", shortName: "ФИО", lastName: "Фамилия", firstName: "Имя", middleName: "Отчество", position: "Должность", additionalProfession: "Доп. профессия", category: "Категория", group: "Раздел", unit: "Единица учёта", quantity: "Количество", inventoryNumber: "Номер", location: "Место хранения", condition: "Состояние", comment: "Комментарий", notes: "Примечание", instances: "Экземпляры", title: "Блок", members: "Состав", date: "Дата", blocks: "Блоки", text: "Текст", weekday: "День недели", isActive: "Активен", absenceType: "Отсутствие", dateFrom: "С", dateTo: "По", replacedName: "Кого заменяет", substitutions: "Подмены и дополнительные сотрудники", trackingMode: "Способ учёта", kind: "Тип записи", employeeId: "Сотрудник", replacedEmployeeId: "Кого заменяет" };
   labels.aliases = "Другие названия и сокращения";
+  Object.assign(labels, { points: "Баллы каждому", participants: "Участники", prize: "Призовое место", type: "Вид участия", competition: "Соревнования", work: "Дополнительные работы", special: "Особый вклад" });
   return Object.entries(value).filter(([key]) => !["id", "createdAt", "updatedAt", "version", "sentVersion", "sentToVkAt"].includes(key)).map(([key, item]) => {
     if (key === "condition") item = equipmentConditions[item]?.label || item;
+    if (key === "type") item = achievementCategoryName(item);
+    if (key === "prize" && typeof item === "boolean") item = item ? "Да" : "Нет";
     if (key === "group") item = equipmentGroups[item] || item;
     if (key === "absenceType") item = absenceLabels[item] || item;
     if (key === "trackingMode") item = item === "quantity" ? "Только количество" : "По экземплярам";
@@ -2512,6 +2647,9 @@ function downloadStateDraft() {
 }
 
 function renderModal() {
+  if (ui.modal.type === "achievementForm") return renderAchievementForm();
+  if (ui.modal.type === "achievementRules") return renderAchievementRules();
+  if (ui.modal.type === "rosterSchedule") return renderRosterScheduleModal();
   if (ui.modal.type === "equipmentMove") return renderEquipmentMoveModal();
   if (ui.modal.type === "syncConflict") return renderSyncConflictModal();
   if (ui.modal.type === "equipmentLocations") return renderEquipmentLocationsModal();
@@ -2524,6 +2662,18 @@ function renderModal() {
   if (ui.modal.type === "blockForm") return renderBlockFormModal();
   if (ui.modal.type === "employeeForm") return renderEmployeeFormModal();
   return "";
+}
+
+function renderRosterScheduleModal() {
+  const schedule = state.rosterSchedule || {};
+  return `<div class="modal-backdrop"><form class="modal" data-roster-schedule-form>
+    <div class="modal-head"><h2>График смен</h2><button class="icon-btn" data-close-modal type="button" aria-label="Закрыть">×</button></div>
+    <div class="modal-body">
+      <label class="schedule-toggle"><input type="checkbox" name="enabled" ${scheduleEnabled(schedule) ? "checked" : ""} /> Только наши смены: сутки через трое</label>
+      <div class="field-group"><label for="schedule-anchor">Дата любого дежурства вашего караула</label><input class="field" id="schedule-anchor" name="anchorDate" type="date" required value="${escapeAttr(schedule.anchorDate || ui.selectedDate)}" /></div>
+      <p class="muted small">Например: дежурство 6 ноября, следующие смены 10, 14 и 18 ноября. Настройка общая для караула. Заполненные раскладки сохраняются. Чтобы открыть дату вне графика, выключите этот режим.</p>
+      <div class="actions"><button class="btn" type="submit">Сохранить</button><button class="ghost-btn" data-close-modal type="button">Отмена</button></div>
+    </div></form></div>`;
 }
 
 function renderAccessModal() {
@@ -2805,8 +2955,45 @@ function bindEvents() {
 }
 
 function bindRosterEvents() {
+  document.querySelector("[data-roster-actions]")?.addEventListener("toggle", (event) => {
+    ui.rosterActionsOpen = event.currentTarget.open;
+  });
+  document.querySelector(".roster-actions-list")?.addEventListener("click", (event) => {
+    if (!event.target.closest("button")) return;
+    ui.rosterActionsOpen = false;
+    event.currentTarget.closest("details").open = false;
+  }, { capture: true });
+  document.querySelector("[data-roster-schedule]")?.addEventListener("click", () => {
+    ui.modal = { type: "rosterSchedule" };
+    render();
+  });
+  document.querySelector("[data-copy-previous-roster]")?.addEventListener("click", () => {
+    if (!can("roster.edit")) return;
+    const previous = previousRosterForDate(ui.selectedDate);
+    if (!previous) return;
+    const current = getRoster();
+    if (allAssignments(current).length && !window.confirm("Заменить назначения и блоки этой даты составом прошлой смены? Комментарий и отметки отсутствия сохранятся.")) return;
+    updateRoster((roster) => {
+      roster.blocks = copyPreviousRosterBlocks(previous, ui.selectedDate);
+      roster.substitutions = {};
+      roster.copiedFromDate = previous.date;
+    });
+    render();
+    showToast("Состав перенесён. Проверьте людей и выберите резервного водителя.");
+  });
+  document.querySelector("[data-reset-roster-assignments]")?.addEventListener("click", () => {
+    if (!can("roster.edit") || !window.confirm("Убрать все фамилии из блоков этой даты? Сотрудники окажутся в списке внизу. Блоки, комментарий и отметки отсутствия сохранятся.")) return;
+    updateRoster((roster) => {
+      roster.blocks.forEach((block) => { block.members = []; });
+      roster.substitutions = {};
+      roster.copiedFromDate = "";
+    });
+    render();
+    showToast("Назначения сброшены. Можно распределить сотрудников заново.");
+  });
   document.querySelectorAll("[data-date-step]").forEach((button) => button.addEventListener("click", () => {
-    ui.selectedDate = isoDate(addDays(parseIsoDate(ui.selectedDate), Number(button.dataset.dateStep)));
+    const direction = Number(button.dataset.dateStep);
+    ui.selectedDate = nearestDutyDate(isoDate(addDays(parseIsoDate(ui.selectedDate), direction)), state.rosterSchedule, direction);
     render();
   }));
   document.querySelector("[data-today]")?.addEventListener("click", () => {
@@ -2872,7 +3059,101 @@ function bindRosterEvents() {
   document.querySelectorAll("[data-generate-preview]").forEach((button) => button.addEventListener("click", openGeneratedPreview));
 }
 
+function bindAchievementForms() {
+  const form = document.querySelector("[data-achievement-form]");
+  if (form) {
+    const updatePoints = () => {
+      const type = form.elements.type.value;
+      const category = achievementFormCategories(achievementList().find((item) => item.id === form.dataset.entryId)).find((item) => item.id === type);
+      form.querySelector("[data-prize-label]").hidden = !(category?.prizeBonus > 0);
+      form.elements.points.value = achievementPoints(type, form.elements.prize.checked, currentAchievementRules(), achievementFormCategories(achievementList().find((item) => item.id === form.dataset.entryId)));
+      form.elements.comment.required = Boolean(category?.requireComment);
+      form.querySelector('label[for="achievement-comment"]').textContent = `Пояснение${category?.requireComment ? " (обязательно)" : ""}`;
+    };
+    form.elements.type.addEventListener("change", () => { form.elements.prize.checked = false; updatePoints(); });
+    form.elements.prize.addEventListener("change", updatePoints);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!can("roster.edit") || !can("stats.view")) return;
+      const data = new FormData(form);
+      const original = achievementList().find((entry) => entry.id === form.dataset.entryId);
+      const now = new Date().toISOString();
+      const category = achievementFormCategories(original).find((item) => item.id === data.get("type"));
+      const entry = {
+        id: original?.id || createId("achievement"), date: String(data.get("date") || ""), title: String(data.get("title") || "").trim(),
+        type: String(data.get("type") || ""), points: Number(data.get("points")), prize: data.has("prize"), typeName: category?.name || "", commentRequired: Boolean(category?.requireComment),
+        participants: [...form.querySelectorAll('[name="participant"]:checked')].map((input) => ({ employeeId: input.value, name: input.dataset.personName })),
+        comment: String(data.get("comment") || "").trim(), createdAt: original?.createdAt || now, updatedAt: now
+      };
+      if (!validAchievement(entry)) {
+        const error = form.querySelector("[data-achievement-error]");
+        error.textContent = !entry.participants.length ? "Отметьте хотя бы одного участника." : "Проверьте дату, баллы и пояснение. Если у вида включено обязательное пояснение, заполните его.";
+        error.hidden = false;
+        return;
+      }
+      state.achievements = [...achievementList().filter((item) => item.id !== entry.id), entry];
+      ui.stats.rewardYear = Number(entry.date.slice(0, 4));
+      ui.stats.rewardSearch = "";
+      ui.stats.rewardType = "";
+      persist(); ui.modal = null; render(); showToast("Участие сохранено. Баллы начислены каждому отмеченному сотруднику.");
+    });
+  }
+  const rulesForm = document.querySelector("[data-achievement-rules-form]");
+  rulesForm?.querySelector("[data-category-add]").addEventListener("click", () => {
+    const category = { id: createId("category"), name: "", points: 1, prizeBonus: 0, requireComment: false, archived: false };
+    rulesForm.querySelector("[data-category-rows]").insertAdjacentHTML("beforeend", renderAchievementCategoryRow(category, false));
+    rulesForm.querySelector(`[data-category-id="${category.id}"] [name="categoryName"]`).focus();
+  });
+  rulesForm?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-toggle-category]");
+    if (!button) return;
+    const row = button.closest("[data-category-row]");
+    if (row.dataset.saved === "false") { row.remove(); return; }
+    const archived = row.dataset.archived !== "true";
+    row.dataset.archived = String(archived);
+    row.querySelector("[data-category-status]").textContent = archived ? "(архив)" : "";
+    button.textContent = archived ? "Вернуть в выбор" : "Убрать из выбора";
+  });
+  rulesForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!can("guard.manage")) return;
+    const categories = [...rulesForm.querySelectorAll("[data-category-row]")].map((row) => ({
+      id: row.dataset.categoryId, name: row.querySelector('[name="categoryName"]').value.trim().replace(/\s+/g, " "),
+      points: Number(row.querySelector('[name="categoryPoints"]').value), prizeBonus: Number(row.querySelector('[name="categoryBonus"]').value),
+      requireComment: row.querySelector('[name="categoryComment"]').checked, archived: row.dataset.archived === "true"
+    }));
+    if (!validAchievementCategories(categories)) {
+      const error = rulesForm.querySelector("[data-category-error]");
+      error.textContent = "Названия должны быть непустыми и разными, баллы целыми от 0 до 1000. Оставьте хотя бы один действующий вид (не больше 100 видов).";
+      error.hidden = false; return;
+    }
+    state.achievementCategories = categories;
+    persist(); ui.modal = null; render(); showToast("Виды участия сохранены. Прежние записи и баллы сохранены.");
+  });
+}
+
 function bindStatsEvents() {
+  document.querySelectorAll("[data-stat-absence]").forEach((button) => button.addEventListener("click", () => {
+    if (!can("stats.view") || !["dayOff", "sickLeave"].includes(button.dataset.statAbsence)) return;
+    ui.sheet = { type: "statAbsences", employeeId: button.dataset.statEmployee, absenceType: button.dataset.statAbsence === "dayOff" ? "DAY_OFF" : "SICK_LEAVE", period: { ...statsPeriod() } };
+    render();
+  }));
+  document.querySelectorAll("[data-stats-section]").forEach((button) => button.addEventListener("click", () => { ui.stats.section = button.dataset.statsSection; render(); }));
+  document.querySelector("[data-achievement-year]")?.addEventListener("change", (event) => { ui.stats.rewardYear = Number(event.target.value); render(); });
+  document.querySelector("[data-achievement-filter]")?.addEventListener("change", (event) => { ui.stats.rewardType = event.target.value; render(); });
+  document.querySelector("[data-achievement-search]")?.addEventListener("input", (event) => {
+    const start = event.target.selectionStart, end = event.target.selectionEnd;
+    ui.stats.rewardSearch = event.target.value; render();
+    const input = document.querySelector("[data-achievement-search]"); input.focus(); input.setSelectionRange(start, end);
+  });
+  document.querySelector("[data-achievement-add]")?.addEventListener("click", () => { ui.modal = { type: "achievementForm" }; render(); });
+  document.querySelector("[data-achievement-rules]")?.addEventListener("click", () => { ui.modal = { type: "achievementRules" }; render(); });
+  document.querySelectorAll("[data-achievement-edit]").forEach((button) => button.addEventListener("click", () => { ui.modal = { type: "achievementForm", id: button.dataset.achievementEdit }; render(); }));
+  document.querySelectorAll("[data-achievement-delete]").forEach((button) => button.addEventListener("click", () => {
+    if (!can("roster.edit") || !window.confirm("Удалить запись об участии? Начисленные за неё баллы будут убраны у всех участников.")) return;
+    state.achievements = achievementList().filter((entry) => entry.id !== button.dataset.achievementDelete);
+    persist(); render();
+  }));
   document.querySelector("[data-open-stats-range]")?.addEventListener("click", () => {
     normalizeStatsDates();
     ui.sheet = { type: "statsRange", month: statsRangeCalendarMonth(), draftFrom: ui.stats.from, draftTo: ui.stats.to };
@@ -3158,6 +3439,17 @@ function selectStatsRangeDate(date) {
 }
 
 function bindModalEvents() {
+  bindAchievementForms();
+  document.querySelector("[data-roster-schedule-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!can("roster.edit")) return;
+    const data = new FormData(event.currentTarget);
+    state.rosterSchedule = { enabled: data.has("enabled"), anchorDate: String(data.get("anchorDate") || "") };
+    persist();
+    ui.modal = null;
+    render();
+    showToast(scheduleEnabled(state.rosterSchedule) ? "Включён график: сутки через трое." : "Снова доступны все даты.");
+  });
   bindEquipmentMoveForm();
   document.querySelector("[data-sync-conflict-form]")?.addEventListener("submit", resolveSyncConflict);
   document.querySelectorAll("[data-close-modal]").forEach((button) => button.addEventListener("click", () => {
@@ -3362,7 +3654,7 @@ function rosterData(roster) {
 }
 
 async function generatePng() {
-  applyCurrentTemplateToFutureDates();
+  saveCurrentRosterTemplate();
   ui.pngStatus = "Генерируем изображение...";
   render();
   const data = rosterData(getRoster());
@@ -3992,10 +4284,6 @@ function normalizeBlockTitle(title) {
 
 function blockTitleForDate(title, date) {
   return isReserveDriverTitle(title) ? reserveDriverLabel(date) : title;
-}
-
-function isReserveDriverTitle(title) {
-  return /^резервн(?:ый|ого)?\s+водител/i.test(String(title || "").trim());
 }
 
 function isDriverPosition(position) {
